@@ -1,0 +1,29 @@
+# 临时协作状态不进入默认版本管理；稳定决定应归入正式项目文档。
+.agent-work/
+# 本机任务、密码、访问地址、日志和上传附件。
+.codex-phone/
+
+# 本地文档、浏览器截图和验证产物。
+/docs/local/
+*.local.md
+/output/
+playwright-report/
+test-results/
+coverage/
+*.log
+*.log.*
+
+# 本机环境变量与私钥；示例配置不得包含真实凭据。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# 依赖和系统文件。
+node_modules/
+.DS_Store

@@ -1,0 +1,16 @@
+{
+  "name": "codex-phone-bridge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "desktop": "node scripts/start-desktop.mjs",
+    "web": "node scripts/web-service.mjs start",
+    "web:restart": "node scripts/web-service.mjs restart",
+    "web:stop": "node scripts/web-service.mjs stop",
+    "web:status": "node scripts/web-service.mjs status",
+    "start": "node src/bridge.mjs --standalone",
+    "test": "node --test test/*.test.mjs",
+    "test:mobile": "node scripts/mobile-smoke.mjs"
+  }
+}

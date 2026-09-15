@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createWebServer } from '../src/http.mjs';
+
+test('image uploads require authentication and origin, preserve bytes and reject false formats', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'phone-upload-'));
+  const server = createWebServer({}, { password: 'test-image-password', origin: 'https://phone.test', uploadDirectory: dir });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(dir, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const headers = { Origin: 'https://phone.test', 'Content-Type': 'application/json' };
+  const image = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=';
+  const upload = value => fetch(base + '/api/uploads', { method: 'POST', headers, body: JSON.stringify({ image: value }) });
+  assert.equal((await upload(image)).status, 401);
+  const login = await fetch(base + '/api/login', { method: 'POST', headers, body: JSON.stringify({ password: 'test-image-password' }) });
+  headers.Cookie = login.headers.get('set-cookie').split(';')[0];
+  headers.Origin = 'https://wrong.test';
+  assert.equal((await upload(image)).status, 403);
+  headers.Origin = 'https://phone.test';
+  const response = await upload(image);
+  assert.equal(response.status, 201);
+  const result = await response.json();
+  assert.equal(result.type, 'localImage');
+  assert.ok(result.path.startsWith(dir + '/'));
+  assert.deepEqual(await readFile(result.path), Buffer.from(image.split(',')[1], 'base64'));
+  assert.equal((await stat(result.path)).mode & 0o777, 0o600);
+  assert.equal((await upload('data:image/png;base64,YmFk')).status, 400);
+  assert.equal((await upload('data:image/svg+xml;base64,PHN2Zz4=')).status, 400);
+  assert.equal((await upload('data:image/png;base64,' + Buffer.alloc(8 * 1024 * 1024 + 1).toString('base64'))).status, 400);
+});

@@ -1,0 +1,116 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { Broker } from '../src/broker.mjs';
+import { createWebServer } from '../src/http.mjs';
+
+test('HTTP authentication, origin checks, receipts and reconnect state', async t => {
+  const sent = [];
+  const broker = new Broker(m => sent.push(m));
+  broker.ready = true;
+  const password = 'test-password-not-production';
+  const server = createWebServer(broker, { password, origin: 'https://phone.example', mode: 'desktop-shared' });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const headers = { Origin: 'https://phone.example', 'Content-Type': 'application/json' };
+  assert.equal((await fetch(`${base}/api/state`)).status, 401);
+  assert.equal((await fetch(`${base}/app.js`)).status, 401);
+  assert.equal((await fetch(`${base}/index.html`)).status, 401);
+  assert.equal((await fetch(`${base}/api/state`, { headers: { Authorization: `Bearer ${password}` } })).status, 401);
+  assert.equal((await fetch(`${base}/api/state`, { headers: { ...headers, Origin: 'https://other.example' } })).status, 403);
+  const redirect = await fetch(base, { redirect: 'manual' });
+  assert.equal(redirect.status, 303);
+  assert.equal(redirect.headers.get('location'), '/login');
+  const page = await fetch(`${base}/login`);
+  assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  const html = await page.text();
+  assert.match(html, /验证后继续/);
+  assert.doesNotMatch(html, /id="workspace"|id="threads"/);
+  assert.match(html, /apple-mobile-web-app-capable/);
+  const manifestResponse = await fetch(`${base}/manifest.webmanifest`);
+  assert.equal(manifestResponse.status, 200);
+  assert.match(manifestResponse.headers.get('content-type'), /application\/manifest\+json/);
+  const manifest = await manifestResponse.json();
+  assert.equal(manifest.start_url, '/');
+  assert.equal(manifest.scope, '/');
+  assert.equal(manifest.display, 'standalone');
+  for (const icon of manifest.icons) {
+    const response = await fetch(base + icon.src);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'image/png');
+    const png = Buffer.from(await response.arrayBuffer());
+    assert.equal(png.subarray(1, 4).toString(), 'PNG');
+    assert.equal(`${png.readUInt32BE(16)}x${png.readUInt32BE(20)}`, icon.sizes);
+  }
+  assert.equal((await fetch(`${base}/service-worker.js`)).status, 401);
+  assert.equal((await fetch(`${base}/api/login`, { method: 'POST', headers, body: JSON.stringify({ password: 'wrong' }) })).status, 401);
+  const login = await fetch(`${base}/api/login`, { method: 'POST', headers, body: JSON.stringify({ password }) });
+  assert.equal(login.status, 200);
+  const cookie = login.headers.get('set-cookie');
+  assert.match(cookie, /__Host-codex-phone=/);
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Secure/);
+  assert.doesNotMatch(cookie, new RegExp(password));
+  headers.Cookie = cookie.split(';')[0];
+  assert.match(await (await fetch(base, { headers })).text(), /id="workspace"/);
+  assert.equal((await fetch(`${base}/app.js`, { headers })).status, 200);
+  const payload = { key: 'phone-001', method: 'thread/list', params: {} };
+  for (let i = 0; i < 2; i++) {
+    assert.equal((await fetch(`${base}/api/commands`, { method: 'POST', headers, body: JSON.stringify(payload) })).status, 202);
+  }
+  assert.equal(sent.length, 1);
+  broker.receive({ id: sent[0].id, result: { data: [{ id: 'existing' }] } });
+  const receipt = await (await fetch(`${base}/api/commands/phone-001`, { headers })).json();
+  assert.equal(receipt.result.data[0].id, 'existing');
+  broker.record('item/agentMessage/delta', { threadId: 'existing', delta: 'result' });
+  const state = await (await fetch(`${base}/api/state?after=0`, { headers })).json();
+  assert.equal(state.mode, 'desktop-shared');
+  assert.equal(state.events[0].params.delta, 'result');
+  assert.equal((await fetch(`${base}/api/commands`, { method: 'POST', headers: { Cookie: headers.Cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })).status, 403);
+  const logout = await fetch(`${base}/api/logout`, { method: 'POST', headers, body: '{}' });
+  assert.equal(logout.status, 200);
+  assert.match(logout.headers.get('set-cookie'), /Max-Age=0/);
+  assert.equal((await fetch(`${base}/api/state`, { headers })).status, 401);
+});
+
+test('login throttling and session expiry are enforced by HTTP', async t => {
+  let time = 100000;
+  const origin = 'http://127.0.0.1:8787';
+  const password = 'test-password-not-production';
+  const broker = new Broker(() => {});
+  const server = createWebServer(broker, { password, origin, mode: 'standalone', now: () => time });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const headers = { Origin: origin, 'Content-Type': 'application/json' };
+  const login = value => fetch(`${base}/api/login`, { method: 'POST', headers, body: JSON.stringify({ password: value }) });
+  for (let i = 0; i < 6; i++) assert.equal((await login(undefined)).status, 401);
+  for (let i = 0; i < 5; i++) assert.equal((await login('wrong')).status, 401);
+  headers['X-Real-IP'] = '192.0.2.10';
+  headers['X-Forwarded-For'] = '192.0.2.11';
+  const limited = await login(password);
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers.get('retry-after'), '60');
+  time += 60001;
+  const accepted = await login(password);
+  assert.equal(accepted.status, 200);
+  assert.doesNotMatch(accepted.headers.get('set-cookie'), /Secure/);
+  headers.Cookie = accepted.headers.get('set-cookie').split(';')[0];
+  assert.equal((await fetch(`${base}/api/state`, { headers })).status, 200);
+  time += 30 * 60 * 1000;
+  assert.equal((await fetch(`${base}/api/state`, { headers })).status, 401);
+});
+
+test('only configured proxy can supply individual login identities', async t => {
+  const origin = 'http://127.0.0.1:8787', password = 'test-password-not-production';
+  const server = createWebServer(new Broker(() => {}), { password, origin, trustedProxyAddresses: ['127.0.0.1'] });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}/api/login`;
+  const login = (ip, value = password) => fetch(base, { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json', ...(ip === undefined ? {} : { 'X-Real-IP': ip }) }, body: JSON.stringify({ password: value }) });
+  for (const ip of [undefined, 'unknown', '192.0.2.1, 192.0.2.2']) assert.equal((await login(ip)).status, 400);
+  for (let i = 0; i < 5; i++) assert.equal((await login('192.0.2.1', 'wrong')).status, 401);
+  assert.equal((await login('::ffff:c000:201')).status, 429, 'mapped IPv4 must share the same bucket');
+  assert.equal((await login('192.0.2.2')).status, 200);
+});

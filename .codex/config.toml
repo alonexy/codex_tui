@@ -1,0 +1,5 @@
+# 项目级配置；保持现有模型、推理强度和权限选择。
+[agents]
+enabled = true
+# 上限不等于目标并发量；实际可用额度仍受宿主限制。
+max_concurrent_threads_per_session = 3

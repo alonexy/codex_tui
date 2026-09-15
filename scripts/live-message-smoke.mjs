@@ -1,0 +1,113 @@
+import { readFile } from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? 'playwright');
+const browser = await chromium.launch({ channel: 'chrome', headless: true });
+try {
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  const receipts = new Map(), calls = [], errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const thread = { id: 'task', name: '同步测试', cwd: '/repo', turns: [] };
+  let events = [], cursor = 0, active = {};
+  let goal = null;
+  await page.addInitScript(() => sessionStorage.setItem('codex-thread', 'task'));
+  await page.route('http://localhost:9789/**', async route => {
+    const req = route.request(), url = new URL(req.url()); let data;
+    if (url.pathname === '/api/state') data = { ready: true, capabilities: { paginatedHistory: true, taskCommands: true }, bridgeId: 'test', cursor, events: events.filter(event => event.cursor > Number(url.searchParams.get('after'))), active, approvals: [] };
+    else if (url.pathname === '/api/projects') data = { projects: [], assignments: {} };
+    else if (url.pathname === '/api/uploads') data = { type: 'localImage', path: '/private/upload.png' };
+    else if (url.pathname === '/api/commands') {
+      const body = req.postDataJSON(); calls.push(body); let result;
+      if (body.method === 'thread/list') result = { data: [thread], nextCursor: null };
+      else if (body.method === 'thread/goal/get') result = { goal };
+      else if (body.method === 'thread/goal/set') { goal = { tokensUsed: 12, timeUsedSeconds: 3, ...goal, ...body.params }; result = { goal }; }
+      else if (body.method === 'thread/goal/clear') { goal = null; result = {}; }
+      else if (body.method === 'thread/items/list') result = { data: thread.turns.flatMap(turn => turn.items.map(item => ({ turnId: 'turn', item: active.task && item.id === 'mobile-message' ? { ...item, id: 'item-2' } : item }))).reverse(), nextCursor: null };
+      else if (body.method === 'turn/interrupt') { active = {}; events.push({ cursor: ++cursor, method: 'turn/completed', params: { threadId: 'task', turn: { id: 'turn', status: 'interrupted' } } }); result = {}; }
+      else if (body.method === 'turn/start') {
+        thread.turns.push({ items: [{ id: 'mobile-message', type: 'userMessage', content: body.params.input }] });
+        active = { task: 'turn' }; cursor++;
+        events.push({ cursor, method: 'turn/started', params: { threadId: 'task' } });
+        events.push({ cursor: ++cursor, method: 'item/completed', params: { threadId: 'task', turnId: 'turn', item: thread.turns.at(-1).items[0] } });
+        result = { turn: { id: 'turn' } };
+      } else result = { thread, model: 'test-model', approvalPolicy: 'on-request', sandbox: { type: 'workspaceWrite' }, reasoningEffort: 'high' };
+      receipts.set(body.key, { status: 'completed', result }); data = { status: 'pending' };
+    } else if (url.pathname.startsWith('/api/commands/')) data = receipts.get(url.pathname.split('/').pop());
+    else {
+      const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+      await route.fulfill({ body: await readFile(new URL('../public/' + file, import.meta.url)), contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html' }); return;
+    }
+    await route.fulfill({ body: JSON.stringify(data), contentType: 'application/json' });
+  });
+  await page.goto('http://localhost:9789');
+  await page.waitForFunction(() => !document.querySelector('#send').disabled);
+  const shortHeight = await page.locator('#message').evaluate(input => input.getBoundingClientRect().height);
+  await page.locator('#message').fill('多行内容\n'.repeat(8));
+  const expandedHeight = await page.locator('#message').evaluate(input => input.getBoundingClientRect().height);
+  assert.ok(expandedHeight > shortHeight, 'textarea grows with multiline content');
+  await page.setViewportSize({ width: 390, height: 400 });
+  await page.waitForFunction(() => parseFloat(document.querySelector('#message').style.maxHeight) <= 160);
+  assert.ok(await page.locator('#message').evaluate(input => input.getBoundingClientRect().height <= 160));
+  await page.locator('#message').fill('短消息');
+  assert.ok(await page.locator('#message').evaluate(input => input.getBoundingClientRect().height <= 48));
+  assert.equal(await page.locator('#message').getAttribute('enterkeyhint'), 'enter');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('#message').fill('状态查询不应删除草稿');
+  await page.locator('#slash-toggle').click();
+  await page.locator('.slash-option').filter({ hasText: '/status' }).click();
+  assert.equal(await page.locator('#status-dialog').isVisible(), true);
+  assert.ok((await page.locator('#status-details').innerText()).includes('同步测试'));
+  assert.ok((await page.locator('#status-details').innerText()).includes('/repo'));
+  assert.ok((await page.locator('#status-details').innerText()).includes('test-model'));
+  assert.ok((await page.locator('#status-details').innerText()).includes('workspaceWrite'));
+  assert.equal(await page.locator('#message').inputValue(), '状态查询不应删除草稿');
+  assert.ok(!calls.some(call => call.method.startsWith('turn/')), 'status is local and sends no model turn');
+  await page.locator('#close-status').click();
+  await page.locator('#slash-toggle').click();
+  await page.getByRole('button', { name: '/goal', exact: false }).click();
+  await page.waitForFunction(() => !document.querySelector('#goal-save').disabled);
+  assert.equal(await page.locator('#message').inputValue(), '状态查询不应删除草稿');
+  await page.locator('#goal-objective').fill('完成手机端目标管理');
+  await page.locator('#goal-budget').fill('40000');
+  await page.locator('#goal-save').click();
+  await page.waitForFunction(() => document.querySelector('#goal-state').textContent.includes('进行中'));
+  assert.equal(goal.objective, '完成手机端目标管理'); assert.equal(goal.tokenBudget, 40000);
+  await page.locator('#goal-pause').click();
+  await page.waitForFunction(() => document.querySelector('#goal-state').textContent.includes('已暂停'));
+  await page.locator('#goal-resume').click();
+  await page.waitForFunction(() => document.querySelector('#goal-state').textContent.includes('进行中'));
+  events.push({ cursor: ++cursor, method: 'thread/goal/updated', params: { threadId: 'task', goal: { ...goal, status: 'blocked', tokensUsed: 123 } } });
+  await page.waitForFunction(() => document.querySelector('#goal-state').textContent.includes('受阻'));
+  assert.ok((await page.locator('#goal-state').innerText()).includes('123'));
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('#goal-clear').click();
+  await page.waitForFunction(() => document.querySelector('#goal-state').textContent.includes('尚未设置'));
+  assert.equal(goal, null);
+  await page.locator('#goal-close').click();
+  assert.ok(!calls.some(call => call.method.startsWith('turn/')), 'goal management uses native goal RPC, not prompts');
+  await page.locator('#image-files').setInputFiles({ name: 'shot.png', mimeType: 'image/png', buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1cAAAAASUVORK5CYII=', 'base64') });
+  await page.waitForFunction(() => document.querySelector('#image-previews img'));
+  await page.locator('#message').fill('手机发出的截图');
+  await page.locator('#send').click();
+  await page.waitForFunction(() => document.querySelector('#history').textContent.includes('手机发出的截图'));
+  const sent = calls.find(call => call.method === 'turn/start');
+  assert.deepEqual(sent.params.input, [{ type: 'text', text: '手机发出的截图' }, { type: 'localImage', path: '/private/upload.png' }]);
+  assert.equal(await page.locator('#image-previews img').count(), 0);
+  const user = { id: 'desktop-message', type: 'userMessage', content: [{ type: 'text', text: '桌面追加的消息' }] };
+  thread.turns[0].items.push(user);
+  events.push({ cursor: ++cursor, method: 'item/completed', params: { threadId: 'task', turnId: 'turn', item: user } });
+  await page.waitForFunction(() => document.querySelector('#history').textContent.includes('桌面追加的消息'));
+  assert.equal(await page.locator('#history .userMessage').count(), 2);
+  assert.equal(await page.locator('#turn-loading').isVisible(), true, 'both user messages appear before turn completion');
+  events.push({ cursor: ++cursor, method: 'item/agentMessage/delta', params: { threadId: 'task', turnId: 'turn', itemId: 'streamed', delta: '实时回复在同一条对话里' } });
+  await page.waitForFunction(() => document.querySelector('#history').textContent.includes('实时回复在同一条对话里'));
+  assert.equal(await page.locator('#live-output').isVisible(), false);
+  assert.equal(await page.locator('#send').isVisible(), true, 'users can append while a turn is running');
+  assert.equal(await page.locator('#stop').isVisible(), true);
+  await page.locator('#stop').click();
+  await page.waitForFunction(() => document.querySelector('#stop').hidden);
+  assert.equal(await page.locator('#history .userMessage').count(), 2, 'interrupt reconciles temporary and persisted IDs without duplicate bubbles');
+  assert.deepEqual(errors, []);
+  assert.ok(calls.filter(call => call.method === 'thread/resume').every(call => call.params.excludeTurns === true));
+  assert.ok(!calls.some(call => call.params.includeTurns === true));
+  console.log('PASS: full app sends text + uploaded localImage; mobile and desktop user messages sync during active turn (mock App Server).');
+} finally { await browser.close(); }

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111716">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Codex">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <title>Codex · 手机控制台</title><link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="app-header"><button id="choose-task" class="secondary" type="button" aria-label="打开会话侧栏" aria-controls="task-dialog" aria-expanded="false" disabled><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button><div class="header-title"><strong id="conversation-title">Codex</strong><span id="status" role="status">正在连接…</span></div><button id="new" class="secondary" aria-label="新建任务" disabled>＋</button></header>
+  <main>
+    <section id="workspace" hidden>
+      <p id="current" class="sr-only">请选择任务，或新建任务。</p>
+      <button id="jump-approvals" type="button" class="attention wide" hidden></button>
+      <section id="approvals" aria-label="待处理请求"></section>
+      <details id="conversation" open><summary>对话记录</summary><button id="older-history" type="button" class="secondary" hidden>加载更早消息</button><div id="history">选择任务后查看对话。</div></details>
+      <section id="live-output" hidden><pre id="events"></pre></section>
+      <div id="turn-loading" role="status" hidden><span class="loading-dot" aria-hidden="true"></span><span id="turn-loading-text">正在回复…</span></div>
+      <form id="compose">
+        <div id="slash-menu" role="region" aria-label="命令菜单" hidden></div>
+        <div id="quick-menu" aria-label="快捷消息" hidden><button type="button" data-message="继续">继续</button><button type="button" data-message="批准">批准</button></div>
+        <div class="composer-box">
+        <input id="image-files" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+        <div id="image-previews" aria-label="待发送图片" hidden></div>
+        <label for="message" class="sr-only">发送消息</label><textarea id="message" rows="1" required placeholder="发送消息，或粘贴截图" inputmode="text" enterkeyhint="enter" autocomplete="off" autocapitalize="sentences"></textarea>
+        <p id="model-label" class="muted small"></p>
+        <div class="composer-tools" role="group" aria-label="消息操作">
+          <button id="attach-image" type="button" class="secondary" aria-label="上传图片或截图" title="上传图片或截图">＋</button>
+          <button id="slash-toggle" type="button" class="secondary" title="命令" aria-label="打开命令菜单" aria-controls="slash-menu" aria-expanded="false"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4"/><path d="m7 9 3 3-3 3m6 0h4"/></svg></button>
+          <button id="quick-toggle" type="button" class="secondary" title="快捷消息" aria-label="打开快捷消息" aria-controls="quick-menu" aria-expanded="false">ϟ</button>
+          <span class="composer-spacer" aria-hidden="true"></span>
+          <button id="voice-input" type="button" class="secondary" aria-label="语音输入" aria-pressed="false" title="语音输入"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3m-4 0h8"/></svg></button>
+          <button type="button" class="danger" id="stop" aria-label="停止当前执行" disabled hidden>■</button>
+          <button id="send" aria-label="发送消息" disabled>↑</button>
+        </div></div>
+        <p id="compose-hint" class="muted small" role="status">先选择一个任务。</p>
+        <p id="media-status" class="muted small" role="status"></p>
+        <p id="delivery-status" class="muted small" role="status"></p>
+        <p id="command-feedback" class="muted small" role="status"></p>
+        <p id="error" class="error" role="alert"></p>
+        <div id="recovery-actions" hidden><button id="check-receipt" class="secondary" type="button">查询发送结果</button><button id="reconcile" class="secondary" type="button" hidden>已核对历史，清除未知提交记录</button></div>
+      </form>
+    </section>
+    <p id="connection-error" class="error" role="alert"></p>
+    <dialog id="task-dialog" aria-labelledby="task-title">
+      <div class="dialog-heading"><h2 id="task-title">会话</h2><button id="close-tasks" type="button" class="secondary" autofocus>关闭</button></div>
+      <p id="mode" class="small muted"></p><div class="toolbar"><button id="refresh" class="secondary">刷新任务</button><button id="logout" class="secondary">锁定并退出</button></div>
+      <button id="manage-devices" type="button" class="secondary wide">登录设备与安全记录</button>
+      <label for="task-search">搜索任务</label><input id="task-search" type="search" placeholder="标题、内容或任务 ID">
+      <label for="project-filter">项目</label><select id="project-filter"><option value="">全部项目</option></select>
+      <div class="toolbar"><button id="search-all" type="button">搜索历史标题</button><button id="recent-tasks" type="button" class="secondary">返回最近任务</button></div>
+      <p id="task-count" class="muted small" role="status"></p><div id="task-list"></div>
+      <button id="more" type="button" class="secondary wide" hidden>加载更多任务</button>
+      <p id="search-scope" class="muted small">项目与桌面项目配置同步。输入可筛选已加载任务，也可搜索历史标题。</p>
+    </dialog>
+    <dialog id="status-dialog" aria-labelledby="status-title">
+      <div class="dialog-heading"><h2 id="status-title">当前状态</h2><button id="close-status" type="button" class="secondary" autofocus>关闭</button></div>
+      <div id="status-details"></div>
+    </dialog>
+    <dialog id="goal-dialog" aria-labelledby="goal-title">
+      <div class="dialog-heading"><h2 id="goal-title">任务目标</h2><button id="goal-close" type="button" class="secondary">关闭</button></div>
+      <p id="goal-state" role="status"></p>
+      <form id="goal-form">
+        <label for="goal-objective">目标与完成条件</label><textarea id="goal-objective" required maxlength="4000" rows="4" placeholder="希望 Codex 持续完成什么？"></textarea>
+        <label for="goal-budget">Token 预算（可选）</label><input id="goal-budget" type="number" inputmode="numeric" min="1" step="1" placeholder="不设上限">
+        <p class="muted small">启动后 Codex 会持续推进目标。更换目标会重置用量统计；需要停止当前执行时使用 /stop。</p>
+        <p id="goal-error" class="error" role="alert"></p>
+        <button id="goal-save" class="wide">创建并启动目标</button>
+      </form>
+      <div class="toolbar"><button id="goal-pause" type="button" class="secondary">暂停目标</button><button id="goal-resume" type="button" class="secondary">继续目标</button><button id="goal-clear" type="button" class="danger">清除目标</button></div>
+    </dialog>
+    <dialog id="new-dialog" aria-labelledby="new-title">
+      <form id="new-form">
+        <h2 id="new-title">新建任务</h2>
+        <label for="new-name">会话名称（可选）</label><input id="new-name" placeholder="留空使用默认名称" autocomplete="off" aria-describedby="new-name-hint">
+        <p id="new-name-hint" class="muted small">之后也可以在会话列表中重命名。</p>
+        <label for="project-choice">所属项目</label><select id="project-choice"></select>
+        <div id="project-workspace">
+          <label for="workspace-choice">组成部分 · 工作目录</label><select id="workspace-choice" aria-describedby="workspace-path"></select>
+          <p id="workspace-path" class="muted small" style="overflow-wrap:anywhere"></p>
+          <p class="muted small">任务归属所选项目，在此目录中工作。</p>
+        </div>
+        <div id="custom-project"><label for="project-path">电脑上的项目路径</label><input id="project-path" required placeholder="/Users/你/Code/项目" autocapitalize="off" spellcheck="false"></div>
+        <p id="new-summary" class="muted small" role="status"></p>
+        <p id="new-error" class="error" role="alert"></p>
+        <div class="toolbar"><button id="create">创建任务</button><button class="secondary" type="button" id="new-check-receipt" hidden>查询创建结果</button><button class="secondary" type="button" id="cancel-new">取消</button></div>
+      </form>
+    </dialog>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

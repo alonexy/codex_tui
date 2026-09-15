@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111716">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Codex">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <title>验证访问</title><link rel="stylesheet" href="/style.css">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <h1>验证后继续</h1>
+    <p class="muted">输入访问密码，连接你的电脑。</p>
+    <form id="login" method="post" action="/api/login">
+      <label for="password">访问密码</label>
+      <div class="password-row"><input id="password" type="password" autocomplete="current-password" required maxlength="1024" aria-describedby="login-error" enterkeyhint="go"><button id="show-password" class="secondary" type="button" aria-pressed="false">显示</button></div>
+      <p id="login-error" class="error" role="alert">正在加载安全登录；若此提示持续显示，请刷新页面或检查浏览器脚本设置。</p>
+      <button id="login-submit" type="submit" class="primary wide" disabled>验证并进入</button>
+    </form>
+    <p class="muted small">未验证前，任务内容与控制接口均不可访问。</p>
+    <noscript>请启用 JavaScript 后登录。</noscript>
+  </main>
+  <script type="module" src="/login.js"></script>
+</body>
+</html>

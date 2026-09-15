@@ -26,6 +26,7 @@ await page.route('http://phone.test/**', async route => {
     if (call.method === 'thread/list') result = { data: [thread], nextCursor: null };
     else if (call.method === 'thread/resume') result = { thread, model: 'test-model', sandbox: { type: 'workspaceWrite' } };
     else if (call.method === 'thread/items/list') result = { data: thread.turns.flatMap(turn => turn.items.map(item => ({ turnId: turn.id, item }))).reverse(), nextCursor: null };
+    else if (call.method === 'thread/turns/list') result = { data: [], nextCursor: null };
     else if (call.method === 'thread/name/set') { thread.name = call.params.name; result = {}; }
     else if (call.method === 'turn/start' || call.method === 'turn/steer') {
       const item = { id: 'sent-' + calls.length, type: 'userMessage', content: call.params.input };

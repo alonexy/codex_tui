@@ -4,6 +4,7 @@ import { createAuth, deviceName } from './auth.mjs';
 import { createAudit } from './audit.mjs';
 import { taskImages } from './images.mjs';
 import { desktopProjects } from './projects.mjs';
+import { desktopModels } from './models.mjs';
 import { saveUpload } from './uploads.mjs';
 import { serviceConfig } from './service-config.mjs';
 import { join } from 'node:path';
@@ -14,6 +15,7 @@ const readOnlyRpc = new Set(['thread/list', 'thread/read', 'thread/resume', 'thr
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/approval-state.js', ['approval-state.js', 'text/javascript; charset=utf-8']],
   ['/composer-media.js', ['composer-media.js', 'text/javascript; charset=utf-8']],
   ['/history-pages.js', ['history-pages.js', 'text/javascript; charset=utf-8']],
   ['/timeline.js', ['timeline.js', 'text/javascript; charset=utf-8']],
@@ -40,7 +42,7 @@ async function body(req, limit = 65536) {
   return JSON.parse(Buffer.concat(chunks).toString());
 }
 
-export function createWebServer(broker, { password, origin, mode, now, allowLanHttp = false, additionalOrigins = [], allowHttpOrigins = [], trustedProxyAddresses = [], auditPath, audit = createAudit({ path: auditPath, now }), uploadDirectory = join(serviceConfig().state, 'uploads') }) {
+export function createWebServer(broker, { password, origin, mode, now, allowLanHttp = false, additionalOrigins = [], allowHttpOrigins = [], trustedProxyAddresses = [], auditPath, audit = createAudit({ path: auditPath, now }), uploadDirectory = join(serviceConfig().state, 'uploads'), readModels = desktopModels }) {
   const auth = createAuth(password, origin, now, { allowLanHttp, additionalOrigins, allowHttpOrigins });
   const source = loginSource(trustedProxyAddresses);
   const allowedOrigins = new Set([origin, ...additionalOrigins]);
@@ -111,6 +113,10 @@ export function createWebServer(broker, { password, origin, mode, now, allowLanH
         return json(200, { ...await broker.snapshot(Number(url.searchParams.get('after')) || 0), ...(mode ? { mode } : {}) });
       }
       if (req.method === 'GET' && url.pathname === '/api/projects') return json(200, await desktopProjects());
+      if (req.method === 'GET' && url.pathname === '/api/models') {
+        try { return json(200, await readModels()); }
+        catch { return json(503, { error: '模型目录暂不可用，请在桌面完成模型同步后重试。' }); }
+      }
       if (req.method === 'GET' && url.pathname.startsWith('/api/images/')) {
         const image = await images.read(url.pathname.slice('/api/images/'.length));
         if (!image) return json(404, { error: '图片未关联到当前任务记录' });

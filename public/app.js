@@ -1,10 +1,11 @@
 import { composerMedia } from './composer-media.js';
 import { HistoryPages } from './history-pages.js';
-import { Timeline } from './timeline.js';
+import { Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary } from './timeline.js';
 import { goalPanel } from './goal-panel.js';
 import { taskPreferences } from './task-preferences.js';
 import { DeliveryState, deliveryLabel } from './delivery-state.js';
 import { devicePanel } from './device-panel.js';
+import { ApprovalState, approvalLabel, isAnswerable } from './approval-state.js';
 const $ = id => document.getElementById(id);
 sessionStorage.removeItem('codex-token');
 let threadId = '';
@@ -14,6 +15,8 @@ let nextCursor = null;
 let connected = false;
 let approvalSignature = '';
 const approvalCards = new Map();
+const pendingApprovals = new ApprovalState();
+let pendingListSignature = '';
 let log = '';
 let polling = false;
 let sending = false;
@@ -28,8 +31,12 @@ let paginatedHistory = false;
 let taskCommands = false;
 let slashBusy = false;
 let creating = false;
-const historyPages = new HistoryPages(command);
+const historyPages = new HistoryPages(command, (id, turns) => {
+  timeline.metadata(id, turns);
+  if (threadId === id) renderHistory(timeline.thread(id), true);
+});
 const timeline = new Timeline();
+const historyViews = new Map();
 const taskStatus = new Map();
 let composingText = false;
 let threads = new Map();
@@ -42,12 +49,14 @@ const freshThreads = new Map();
 const mediaUrls = new Map();
 const modelOverrides = new Map();
 const defaultModels = new Map();
+const modelSettingVersions = new Map();
+let submittedModelSetting = null;
 const slashCommands = [
   ['/new', '新建会话', '任务'], ['/resume', '切换会话', '任务'],
   ['/rename', '重命名当前会话', '任务'], ['/compact', '压缩当前上下文', '任务'],
   ['/stop', '停止当前执行', '任务'],
   ['/goal', '创建目标、设置预算、暂停或继续', '目标'],
-  ['/model', '设置后续新一轮的模型', '模型与状态'], ['/status', '当前会话状态', '模型与状态'],
+  ['/model', '选择下轮模型与推理强度', '模型与状态'], ['/status', '当前会话状态', '模型与状态'],
   ['/approvals', '查看待审批请求', '模型与状态'], ['/help', '查看命令帮助', '模型与状态'],
 ];
 function requireTaskCommands() {
@@ -123,6 +132,7 @@ async function command(method, params = {}, sessionName) {
     delivery.begin(key, method, params.threadId, method === 'thread/name/set' ? params.name : sessionName);
     uncertainSubmission = true;
     if (submittedDraft && ['turn/start', 'turn/steer'].includes(method)) submittedDraft.key = key;
+    if (submittedModelSetting && method === 'turn/start') submittedModelSetting.key = key;
   }
   try {
     await api('/api/commands', { key, method, params });
@@ -158,6 +168,7 @@ async function recoverSubmission() {
     uncertainSubmission = false;
     const id = pending.threadId || record.result?.thread?.id || threadId;
     const success = record.status === 'completed';
+    if (submittedModelSetting?.key === pending.key) finishModelSubmission(success);
     deliveryOutcomes.set(id, success ? '已接收 · 回执已确认' : '发送失败 · 服务已确认，可修改后重试');
     if (success) {
       $('error').textContent = '';
@@ -165,6 +176,7 @@ async function recoverSubmission() {
       if (['turn/start', 'turn/steer'].includes(pending.method)) freshThreads.delete(id);
       if (pending.method === 'thread/start' && record.result?.thread) {
         freshThreads.set(id, record.result.thread);
+        rememberThreadStatus(id, record.result);
         if (record.result.model) defaultModels.set(id, record.result.model);
         if ($('new-dialog').open) $('new-dialog').close();
         $('new-name').value = '';
@@ -218,10 +230,12 @@ async function list(more = false) {
         projectAssignments = metadata.assignments;
       } catch (error) { $('search-scope').textContent = `无法同步桌面项目：${error.message}`; }
     }
+    const statusToken = pendingApprovals.token();
     const result = await command('thread/list', { limit: 30, sortKey: 'updated_at', ...taskQuery, ...(more ? { cursor: nextCursor } : {}) });
     if (!more) threads.clear();
     for (const thread of result.data) {
       threads.set(thread.id, thread);
+      pendingApprovals.thread(thread.id, thread.status, statusToken);
     }
     for (const [id, thread] of freshThreads) if (!threads.has(id)) threads.set(id, thread);
     preferences.refreshFavorites(threads.values());
@@ -229,6 +243,7 @@ async function list(more = false) {
     $('more').hidden = !nextCursor;
     updateProjects();
     renderTasks();
+    renderApprovals();
   } finally {
     listing = false;
     for (const id of ['more', 'refresh', 'search-all', 'recent-tasks']) $(id).disabled = false;
@@ -284,10 +299,20 @@ function rememberWorkspaceChoice() {
 }
 
 function renderTaskStates() {
+  const waiting = pendingApprovals.entries();
   for (const label of $('task-list').querySelectorAll('[data-task-status]')) {
     const running = !!active[label.dataset.taskStatus];
-    label.dataset.state = running ? 'running' : connected ? 'idle' : 'unknown';
-    label.textContent = running ? '运行中' : connected ? '空闲' : '等待同步';
+    const pending = waiting.get(label.dataset.taskStatus);
+    label.dataset.state = pending ? 'waiting' : !connected ? 'unknown' : running ? 'running' : 'idle';
+    label.textContent = pending ? approvalLabel(pending) : !connected ? '等待同步' : running ? '运行中' : '空闲';
+  }
+  for (const badge of $('task-list').querySelectorAll('[data-project-pending]')) {
+    const count = [...waiting.values()].filter(entry => {
+      const task = threads.get(entry.id) ?? preferences.favorites().find(task => task.id === entry.id) ?? { id: entry.id };
+      return (desktopProjectList.find(project => matchesProject(task, project.id))?.id ?? 'other') === badge.dataset.projectPending;
+    }).length;
+    badge.hidden = !count;
+    badge.textContent = `${count} 个会话待处理`;
   }
   for (const button of $('task-list').querySelectorAll('[data-rename-thread]')) {
     const reason = commandUnavailable('/rename', button.dataset.renameThread);
@@ -334,7 +359,7 @@ function renderTasks() {
     button.append(title, state, path, meta);
     button.disabled = selecting || sending || stopping || slashBusy || creating;
     button.onclick = async () => {
-      try { await select(task.id); $('task-dialog').close(); }
+      try { await select(task.id); $('task-dialog').close(); if (pendingApprovals.get(task.id)) locateApproval(); }
       catch (error) { $('task-count').textContent = `切换失败：${error.message}`; }
     };
     const favorite = document.createElement('button'); favorite.type = 'button'; favorite.className = 'task-favorite secondary';
@@ -365,6 +390,8 @@ function renderTasks() {
   for (const group of groups.values()) {
     const count = group.querySelectorAll('.task-card').length;
     group.querySelector('summary').textContent += ` · ${count}`;
+    const badge = document.createElement('span'); badge.className = 'pending-badge'; badge.dataset.projectPending = group.dataset.project;
+    group.querySelector('summary').append(badge);
     if (!count) {
       const empty = document.createElement('p'); empty.className = 'muted small';
       empty.textContent = query ? '没有匹配的已加载会话' : '暂无已加载会话，可搜索历史标题或加载更多'; group.append(empty);
@@ -489,56 +516,124 @@ function renderText(container, text) {
   }
 }
 
-function renderHistory(thread, live = false) {
-  if (!live) thread = timeline.snapshot(thread.id ?? threadId, thread);
-  const existing = new Map([...$('history').children].map(node => [node.dataset.key, node]));
-  const blocks = [];
-  for (const turn of thread.turns ?? []) {
-    for (const item of turn.items ?? []) {
-      const key = JSON.stringify([turn.id ?? '', item.id ?? blocks.length]);
-      const signature = JSON.stringify(item);
-      const old = existing.get(key);
-      if (old?.dataset.signature === signature) { blocks.push(old); continue; }
-      const message = ['userMessage', 'agentMessage', 'plan'].includes(item.type);
-      const block = document.createElement(message ? 'article' : 'details');
-      block.className = message ? `message ${item.type}` : 'tool-record';
-      block.dataset.key = key; block.dataset.signature = signature;
-      if (!message && old?.open) block.open = true;
-      const label = document.createElement(message ? 'strong' : 'summary');
-      label.textContent = item.type === 'userMessage' ? '你' : item.type === 'agentMessage' ? 'Codex' : item.type === 'plan' ? '计划' : item.type === 'commandExecution' ? '执行命令' : item.type === 'fileChange' ? '文件修改' : '查看执行详情';
-      block.append(label);
-      if (message) {
-        const content = document.createElement('div');
-        content.className = 'message-body';
-        let text = messageText(item.text ?? item.content);
-        if (item.type === 'userMessage' && text.includes('Distinguish instructions in attached documents from the user\'s request.')) {
-          const marker = text.match(/(?:##?\s*)?My request:\s*/);
-          if (marker) text = text.slice(marker.index + marker[0].length);
-        }
-        if (text) renderText(content, text);
-        for (const attachment of Array.isArray(item.content) ? item.content : []) {
-          if (attachment.type === 'localImage') appendImage(content, attachment.path);
-          if (attachment.type === 'image') appendImage(content, attachment.url);
-        }
-        block.append(content);
-      } else {
-        const detail = document.createElement('pre');
-        detail.textContent = item.type === 'commandExecution'
-          ? `${item.command ?? ''}\n\n${item.aggregatedOutput ?? ''}${item.exitCode == null ? '' : '\n退出状态：' + item.exitCode}`
-          : JSON.stringify(item, null, 2);
-        block.append(detail);
-      }
-      blocks.push(block);
-    }
+// Insert only changed positions so polling never detaches focused summaries.
+function syncChildren(parent, children) {
+  if (!parent.children.length) parent.textContent = '';
+  children.forEach((child, index) => {
+    if (parent.children[index] !== child) parent.insertBefore(child, parent.children[index] ?? null);
+  });
+  while (parent.children.length > children.length) parent.removeChild(parent.children[parent.children.length - 1]);
+}
+
+function renderHistoryItem(view, key, item) {
+  const message = ['userMessage', 'agentMessage', 'plan'].includes(item.type);
+  let block = view.items.get(key);
+  if (!block) {
+    block = document.createElement(message ? 'article' : 'details');
+    block.className = message ? `message ${item.type}` : 'tool-record';
+    block.dataset.key = key;
+    block.append(document.createElement(message ? 'strong' : 'summary'));
+    view.items.set(key, block);
   }
-  if (blocks.length !== $('history').children.length || blocks.some((block, index) => $('history').children[index] !== block)) $('history').replaceChildren(...blocks);
+  const signature = JSON.stringify(item);
+  if (block.dataset.signature === signature) return block;
+  block.dataset.signature = signature;
+  const label = block.children[0];
+  if (message) {
+    label.textContent = item.type === 'userMessage' ? '你' : item.type === 'plan' ? '计划' : isProcessItem(item) ? '进度' : 'Codex';
+    const content = document.createElement('div');
+    content.className = 'message-body';
+    let text = messageText(item.text ?? item.content);
+    if (item.type === 'userMessage' && text.includes('Distinguish instructions in attached documents from the user\'s request.')) {
+      const marker = text.match(/(?:##?\s*)?My request:\s*/);
+      if (marker) text = text.slice(marker.index + marker[0].length);
+    }
+    if (text) renderText(content, text);
+    for (const attachment of Array.isArray(item.content) ? item.content : []) {
+      if (attachment.type === 'localImage') appendImage(content, attachment.path);
+      if (attachment.type === 'image') appendImage(content, attachment.url);
+    }
+    syncChildren(block, [label, content]);
+  } else {
+    const state = operationFailed(item) ? '未成功' : { inProgress: '进行中', completed: '完成', interrupted: '已停止' }[item.status];
+    label.textContent = `${processAction(item)}${state ? ' · ' + state : ''}`;
+    block.classList.toggle('process-attention', operationFailed(item));
+    // Long raw output is created on demand, retaining the native disclosure DOM.
+    const updateOutput = () => {
+      if (!block.open) return;
+      let detail = block.querySelector('pre');
+      if (!detail) { detail = document.createElement('pre'); detail.tabIndex = 0; block.append(detail); }
+      detail.textContent = item.type === 'commandExecution'
+        ? `${item.command ?? ''}\n\n${item.aggregatedOutput ?? ''}${item.exitCode == null ? '' : '\n退出状态：' + item.exitCode}`
+        : JSON.stringify(item, null, 2);
+    };
+    block.ontoggle = updateOutput;
+    updateOutput();
+  }
+  return block;
+}
+
+function renderHistory(thread, live = false) {
+  const id = thread.id ?? threadId;
+  if (!live) thread = timeline.snapshot(id, thread);
+  let view = historyViews.get(id);
+  if (!view) { view = { turns: new Map(), items: new Map() }; historyViews.set(id, view); }
+  const blocks = [];
+  for (const [index, turn] of (thread.turns ?? []).entries()) {
+    const key = turn.id ?? `missing-${index}`;
+    let nodes = view.turns.get(key);
+    if (!nodes) {
+      const section = document.createElement('section'); section.className = 'turn'; section.dataset.turnId = key;
+      const process = document.createElement('details'); process.className = 'turn-process';
+      const summary = document.createElement('summary');
+      const title = document.createElement('span'); title.className = 'process-title';
+      const action = document.createElement('span'); action.className = 'process-action';
+      const error = document.createElement('span'); error.className = 'process-error';
+      summary.append(title, action, error);
+      const list = document.createElement('div'); list.className = 'process-list';
+      const empty = document.createElement('p'); empty.className = 'muted small'; empty.textContent = '暂无可用过程记录';
+      process.append(summary, list);
+      // Reading the process is a deliberate move away from following the tail.
+      summary.addEventListener('click', () => { followingLatest = false; });
+      nodes = { section, process, title, action, error, list, empty }; view.turns.set(key, nodes);
+    }
+    const items = turnItems(turn);
+    const summary = processSummary(turn, active[id] === turn.id);
+    for (const field of ['title', 'action', 'error']) {
+      const text = field === 'title' ? summary.text : summary[field];
+      if (nodes[field].textContent !== text) nodes[field].textContent = text;
+      nodes[field].hidden = !text;
+    }
+    nodes.process.classList.toggle('process-attention', summary.attention);
+    const processItems = [], messages = [];
+    const hasItems = items.some(isProcessItem);
+    const showProcess = hasItems || !!summary.status;
+    let inserted = false;
+    items.forEach((item, itemIndex) => {
+      const processItem = isProcessItem(item);
+      if (!inserted && showProcess && (processItem || (!hasItems && item.type !== 'userMessage'))) {
+        messages.push(nodes.process); inserted = true;
+      }
+      const block = renderHistoryItem(view, JSON.stringify([key, item.id ?? itemIndex]), item);
+      (processItem ? processItems : messages).push(block);
+    });
+    if (showProcess && !inserted) messages.push(nodes.process);
+    syncChildren(nodes.list, processItems.length ? processItems : [nodes.empty]);
+    syncChildren(nodes.section, messages);
+    blocks.push(nodes.section);
+  }
+  syncChildren($('history'), blocks);
   if (!blocks.length) $('history').textContent = '暂无历史消息';
 }
 
 async function loadHistory(id) {
   if (paginatedHistory) return historyPages.read(id);
+  const statusToken = pendingApprovals.token();
+  const settingsVersion = modelSettingVersions.get(id) ?? 0;
   const result = await command('thread/resume', { threadId: id, excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } });
-  taskStatus.set(id, { ...taskStatus.get(id), ...result });
+  pendingApprovals.thread(id, result.thread?.status, statusToken);
+  renderApprovals();
+  rememberThreadStatus(id, result, settingsVersion);
   if (!result.initialTurnsPage) throw Error('桌面桥接尚未支持分页，请在当前任务结束后重新启动桌面 App。');
   return { thread: { ...result.thread, turns: [...result.initialTurnsPage.data].reverse() } };
 }
@@ -550,19 +645,24 @@ async function select(id) {
   updateControls();
   renderTasks();
   try {
+    const statusToken = pendingApprovals.token();
+    const settingsVersion = modelSettingVersions.get(id) ?? 0;
     const result = freshThreads.has(id)
       ? { thread: freshThreads.get(id) }
       : await command('thread/resume', { threadId: id, excludeTurns: true, ...(!paginatedHistory ? { initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } : {}) });
-    taskStatus.set(id, { ...taskStatus.get(id), ...result });
+    pendingApprovals.thread(id, result.thread?.status, statusToken);
+    rememberThreadStatus(id, result, settingsVersion);
     if (!paginatedHistory && result.initialTurnsPage) result.thread.turns = [...result.initialTurnsPage.data].reverse();
     if (paginatedHistory && !freshThreads.has(id)) {
       const page = await historyPages.read(id);
       result.thread.turns = page.thread.turns;
     }
     if (request !== selection) return;
+    const switched = threadId !== id;
     if (result.model && !defaultModels.has(id)) defaultModels.set(id, result.model);
     if (threadId) drafts.set(threadId, $('message').value);
     threadId = id;
+    if (switched && $('model-dialog').open) $('model-dialog').close();
     $('message').value = drafts.get(id) ?? '';
     sessionStorage.setItem('codex-thread', id);
     threads.set(id, result.thread);
@@ -575,7 +675,8 @@ async function select(id) {
     $('conversation').open = true;
     log = '';
     $('events').textContent = '等待新的输出…';
-    followingLatest = true;
+    renderApprovals();
+    if (switched) followingLatest = true;
     scrollToLatest();
   } finally {
     if (request === selection) { selecting = false; updateControls(); renderTasks(); }
@@ -598,6 +699,8 @@ function updateControls() {
   $('stop').title = $('stop').getAttribute('aria-label');
   $('turn-loading').hidden = !(sending || running || stopping);
   $('turn-loading-text').textContent = !connected ? '连接中断，正在恢复执行状态…' : stopping ? '正在停止…' : sending ? '正在发送…' : '正在回复…';
+  const waiting = pendingApprovals.get(threadId);
+  if (waiting && !sending && !stopping) $('turn-loading').hidden = true;
   $('quick-toggle').disabled = !connected || uncertainSubmission || !threadId || sending || selecting || stopping;
   for (const button of $('quick-menu').querySelectorAll('button')) button.disabled = $('quick-toggle').disabled;
   $('new').disabled = !connected || uncertainSubmission || sending || stopping || selecting || slashBusy || creating;
@@ -609,15 +712,18 @@ function updateControls() {
   $('new-check-receipt').disabled = !connected || recovering || creating;
   $('new-name-hint').textContent = taskCommands ? '之后也可以在会话列表中重命名。' : '当前桥接不支持命名；留空可创建，任务结束后重启桌面 App 可启用命名。';
   $('delivery-status').textContent = deliveryLabel({ connected, pending: uncertainSubmission, sending, running, stopping, outcome: deliveryOutcomes.get(threadId) });
+  if (waiting && !uncertainSubmission && !sending && !stopping) $('delivery-status').textContent = '';
   $('recovery-actions').hidden = !uncertainSubmission;
   $('reconcile').hidden = !uncertainSubmission;
   $('reconcile').disabled = sending || stopping || recovering || slashBusy;
   $('check-receipt').disabled = !connected || recovering || sending || stopping;
   $('choose-task').disabled = $('workspace').hidden;
   $('compose-hint').textContent = selecting ? '正在切换会话…' : !threadId ? '选择会话，或输入 /new 新建' : '';
-  $('model-label').textContent = modelOverrides.get(threadId) || '';
+  $('model-label').textContent = pendingModelLabel(threadId);
+  updateModelAvailability();
   resizeMessage();
   renderTaskStates();
+  renderApprovalReminders();
   updateCommandAvailability();
   if ($('status-dialog').open) renderStatus();
 }
@@ -692,6 +798,7 @@ let commandDialog;
 function openCommandForm(name, initial, targetId = threadId, recovery = false) {
   const unavailable = commandUnavailable(name, targetId);
   if (unavailable && !recovery) throw Error(unavailable);
+  if (name === '/model') return openModelPicker(targetId);
   if (!commandDialog) {
     commandDialog = document.createElement('dialog'); commandDialog.id = 'command-dialog';
     commandDialog.setAttribute('aria-labelledby', 'command-title');
@@ -713,21 +820,20 @@ function openCommandForm(name, initial, targetId = threadId, recovery = false) {
   const id = targetId, key = JSON.stringify([id, name]);
   commandDialog.dataset.threadId = id; commandDialog.dataset.command = name;
   const input = $('command-argument'), save = $('command-save'), cancel = $('command-cancel');
-  const model = name === '/model';
   const task = threads.get(id) ?? preferences.favorites().find(task => task.id === id);
-  $('command-title').textContent = model ? '设置模型' : '重命名任务';
-  $('command-label').textContent = model ? '模型 ID' : '新标题';
-  $('command-hint').textContent = model ? '仅用于后续新一轮；输入 default 恢复默认。模型 ID 会在发送时校验。' : '修改这条会话的显示名称，消息草稿和附件会保留。';
-  input.placeholder = model ? '例如 gpt-5.4 或 default' : '输入任务标题';
-  input.autocapitalize = model ? 'off' : 'sentences'; input.spellcheck = !model;
-  input.value = initial ?? commandDrafts.get(key) ?? (model ? modelOverrides.get(id) || defaultModels.get(id) || '' : task?.name || task?.preview || '');
+  $('command-title').textContent = '重命名任务';
+  $('command-label').textContent = '新标题';
+  $('command-hint').textContent = '修改这条会话的显示名称，消息草稿和附件会保留。';
+  input.placeholder = '输入任务标题';
+  input.autocapitalize = 'sentences'; input.spellcheck = true;
+  input.value = initial ?? commandDrafts.get(key) ?? (task?.name || task?.preview || '');
   input.oninput = () => commandDrafts.set(key, input.value);
   $('command-error').textContent = '';
   input.disabled = false; save.disabled = false; cancel.disabled = false;
   let busy = false;
   const cancelDraft = () => {
     commandDrafts.set(key, input.value);
-    if (!model && !(delivery.pending?.method === 'thread/name/set' && delivery.pending.threadId === id)) delivery.finishNaming(id);
+    if (!(delivery.pending?.method === 'thread/name/set' && delivery.pending.threadId === id)) delivery.finishNaming(id);
   };
   cancel.onclick = () => { cancelDraft(); commandDialog.close(); };
   commandDialog.oncancel = event => { if (busy) event.preventDefault(); else cancelDraft(); };
@@ -736,13 +842,11 @@ function openCommandForm(name, initial, targetId = threadId, recovery = false) {
     event.preventDefault();
     if (busy) return;
     commandDrafts.set(key, input.value);
-    if (!input.value.trim()) { $('command-error').textContent = model ? '请输入模型 ID' : '请输入新标题'; return; }
-    if (model && threadId !== id) { $('command-error').textContent = '当前任务已切换，请关闭后重新打开表单'; return; }
+    if (!input.value.trim()) { $('command-error').textContent = '请输入新标题'; return; }
     busy = true; input.disabled = true; save.disabled = true; cancel.disabled = true;
     $('command-error').textContent = '';
     try {
-      if (model) await runSlash(`${name} ${input.value.trim()}`, true);
-      else await runRename(id, input.value.trim());
+      await runRename(id, input.value.trim());
       commandDrafts.delete(key); commandDialog.close();
     } catch (error) { $('command-error').textContent = error.message; }
     finally { busy = false; input.disabled = false; cancel.disabled = false; updateControls(); }
@@ -752,6 +856,149 @@ function openCommandForm(name, initial, targetId = threadId, recovery = false) {
   updateCommandAvailability();
   input.focus({ preventScroll: true });
 }
+
+let modelRequest = 0;
+let modelCatalog = null;
+let modelLoading = false;
+let modelDraftChanged = false;
+function effortLabel(effort) {
+  const labels = { none: '无', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: 'Ultra' };
+  return Object.hasOwn(labels, effort) ? labels[effort] : effort;
+}
+function modelSettingLabel(setting) {
+  return `${setting?.model || '未知型号'} · ${effortLabel(setting?.effort) ?? '强度未知'}`;
+}
+function currentModelSetting(id) {
+  const status = taskStatus.get(id);
+  return { model: status && Object.hasOwn(status, 'model') ? status.model : defaultModels.get(id), effort: status?.reasoningEffort };
+}
+function rememberThreadStatus(id, result, version = modelSettingVersions.get(id) ?? 0) {
+  const previous = taskStatus.get(id) ?? {}, next = { ...previous, ...result };
+  if (version === (modelSettingVersions.get(id) ?? 0)) {
+    if (Object.hasOwn(result.thread ?? {}, 'model')) next.model = result.thread.model;
+    if (Object.hasOwn(result.thread ?? {}, 'reasoningEffort')) next.reasoningEffort = result.thread.reasoningEffort;
+  } else { next.model = previous.model; next.reasoningEffort = previous.reasoningEffort; }
+  taskStatus.set(id, next);
+}
+function pendingModelLabel(id) {
+  if (!modelOverrides.has(id)) return '';
+  const pending = submittedModelSetting?.setting === modelOverrides.get(id) && uncertainSubmission;
+  return `${pending ? '设置提交待确认' : '下轮（尚未发送）'}：${modelSettingLabel(modelOverrides.get(id))}`;
+}
+function finishModelSubmission(success) {
+  if (success && submittedModelSetting && modelOverrides.get(submittedModelSetting.id) === submittedModelSetting.setting) modelOverrides.delete(submittedModelSetting.id);
+  submittedModelSetting = null;
+}
+function renderModelCurrent(current = currentModelSetting(threadId)) {
+  $('model-current').textContent = `当前会话：${modelSettingLabel(current)}${pendingModelLabel(threadId) ? `；${pendingModelLabel(threadId)}` : ''}`;
+}
+function chosenModel() { return modelCatalog?.models.find(model => model.id === $('model-choice').value); }
+function updateModelAvailability() {
+  if (!$('model-dialog').open) return;
+  const validThread = $('model-dialog').dataset.threadId === threadId;
+  const reason = validThread ? commandUnavailable('/model') : '当前会话已切换，请关闭后重新打开';
+  const model = chosenModel();
+  $('model-save').disabled = modelLoading || !!reason || !model?.supportedReasoningEfforts.some(option => option.effort === $('effort-choice').value);
+  $('model-choice').disabled = modelLoading || !!reason || !modelCatalog?.models.length;
+  $('effort-choice').disabled = $('model-choice').disabled || !model?.supportedReasoningEfforts.length;
+  if (!validThread) $('model-error').textContent = reason;
+}
+function renderEffortChoices(preferred, useDefault = false) {
+  const model = chosenModel();
+  $('model-description').textContent = model?.description || '';
+  const options = model?.supportedReasoningEfforts ?? [];
+  $('effort-choice').replaceChildren(...options.map(option => new Option(`${effortLabel(option.effort)}${option.effort === model.defaultReasoningEffort ? '（模型默认）' : ''}`, option.effort)));
+  const effort = options.some(option => option.effort === preferred) ? preferred : useDefault ? model?.defaultReasoningEffort : null;
+  if (!effort) {
+    const placeholder = new Option(options.length ? useDefault ? '请选择强度（目录未提供默认值）' : '请选择强度（当前值未知或不支持）' : '目录未提供可用推理强度', '');
+    placeholder.disabled = true;
+    $('effort-choice').replaceChildren(placeholder, ...$('effort-choice').options);
+  }
+  $('effort-choice').value = effort || '';
+  renderEffortDescription();
+}
+function renderEffortDescription() {
+  $('effort-description').textContent = chosenModel()?.supportedReasoningEfforts.find(option => option.effort === $('effort-choice').value)?.description || '';
+  updateModelAvailability();
+}
+function renderModelChoices(preferred) {
+  $('model-choice').replaceChildren(...modelCatalog.models.map(model => new Option(model.displayName, model.id)));
+  if (modelCatalog.models.some(model => model.id === preferred.model)) $('model-choice').value = preferred.model;
+  else {
+    const placeholder = new Option('请选择目录中的模型', ''); placeholder.disabled = true;
+    $('model-choice').replaceChildren(placeholder, ...$('model-choice').options); $('model-choice').value = '';
+    $('model-error').textContent = modelCatalog.models.length
+      ? preferred.model ? `当前设置 ${preferred.model} 不在可选目录中；支持强度未知，请选择其他模型。` : '服务未返回当前型号，请选择模型。'
+      : '目录中没有可展示的模型，请在桌面同步后重试。';
+  }
+  renderEffortChoices(preferred.effort);
+}
+async function loadModelChoices(id, draft) {
+  const request = ++modelRequest;
+  const settingsVersion = modelSettingVersions.get(id) ?? 0;
+  modelLoading = true; modelCatalog = null;
+  $('model-choice').replaceChildren(new Option('正在读取模型目录…', ''));
+  $('effort-choice').replaceChildren();
+  $('model-description').textContent = ''; $('effort-description').textContent = '';
+  $('model-source').textContent = '正在读取桌面缓存…'; $('model-error').textContent = '';
+  $('model-current').textContent = '正在读取当前会话设置…';
+  updateModelAvailability();
+  const isCurrent = () => request === modelRequest && $('model-dialog').open && $('model-dialog').dataset.threadId === id && threadId === id;
+  try {
+    const [directory, settings] = await Promise.allSettled([
+      api('/api/models'), command('thread/read', { threadId: id, includeTurns: false }),
+    ]);
+    if (!isCurrent()) return;
+    let current = { model: null, effort: null }, settingsError = '';
+    if (settingsVersion !== (modelSettingVersions.get(id) ?? 0)) current = currentModelSetting(id);
+    else if (settings.status === 'fulfilled' && settings.value?.thread) {
+      rememberThreadStatus(id, { model: settings.value.thread.model ?? null, reasoningEffort: settings.value.thread.reasoningEffort ?? null }, settingsVersion);
+      current = currentModelSetting(id);
+    } else settingsError = '当前会话设置读取失败；当前值未知，可重试或明确选择下轮设置。';
+    renderModelCurrent(current);
+    if (directory.status === 'rejected') throw directory.reason;
+    const catalog = directory.value;
+    modelCatalog = catalog;
+    const synced = catalog.fetchedAt ? `上次同步：${new Date(catalog.fetchedAt).toLocaleString()}` : '同步时间未知';
+    $('model-source').textContent = `来源：桌面缓存 · ${synced}${catalog.stale ? '。目录可能已过期，请在桌面同步后重新读取。' : ''}`;
+    renderModelChoices(draft ?? modelOverrides.get(id) ?? current);
+    if (settingsError) $('model-error').textContent = settingsError;
+  } catch (error) {
+    if (!isCurrent()) return;
+    $('model-source').textContent = '来源：桌面缓存';
+    $('model-error').textContent = error.message;
+    $('model-choice').replaceChildren(new Option('模型目录暂不可用', ''));
+  } finally {
+    if (isCurrent()) { modelLoading = false; updateModelAvailability(); }
+  }
+}
+function openModelPicker(id = threadId) {
+  const dialog = $('model-dialog');
+  dialog.dataset.threadId = id;
+  modelDraftChanged = false;
+  $('slash-menu').hidden = true; $('slash-toggle').setAttribute('aria-expanded', 'false');
+  if (!dialog.open) dialog.showModal();
+  return loadModelChoices(id);
+}
+function saveModelSetting(id, model, effort) {
+  if (id !== threadId) throw Error('当前会话已切换，请重新选择模型');
+  if (!model?.supportedReasoningEfforts.some(option => option.effort === effort)) throw Error('请选择目录中支持的模型与推理强度');
+  modelOverrides.set(id, { model: model.id, effort });
+  $('command-feedback').textContent = `后续新一轮使用：${modelSettingLabel(modelOverrides.get(id))}。当前执行保持原设置。`;
+  updateControls();
+}
+$('model-choice').onchange = () => { modelDraftChanged = true; $('model-error').textContent = ''; renderEffortChoices(undefined, true); };
+$('effort-choice').onchange = () => { modelDraftChanged = true; renderEffortDescription(); };
+$('model-reload').onclick = () => loadModelChoices($('model-dialog').dataset.threadId, modelDraftChanged ? { model: $('model-choice').value, effort: $('effort-choice').value } : undefined);
+$('model-cancel').onclick = () => $('model-dialog').close();
+$('model-dialog').onclose = () => { if (!$('model-dialog').open) $('slash-toggle').focus({ preventScroll: true }); };
+$('model-form').onsubmit = event => {
+  event.preventDefault();
+  updateModelAvailability();
+  if ($('model-save').disabled) return;
+  try { saveModelSetting($('model-dialog').dataset.threadId, chosenModel(), $('effort-choice').value); $('model-dialog').close(); }
+  catch (error) { $('model-error').textContent = error.message; }
+};
 
 function applyTaskName(id, name, announce = true) {
   const task = threads.get(id) ?? preferences.favorites().find(task => task.id === id);
@@ -830,24 +1077,19 @@ async function executeSlash(text, preserveDraft = false) {
   if (!['/model', '/rename', '/goal'].includes(name) && args.length) throw Error(`${name} 不需要参数`);
   if (name === '/model') {
     if (!threadId) throw Error('请先选择会话');
-    if (args.length > 1) throw Error('用法：/model 模型ID');
-    if (args[0] === 'default' && !defaultModels.has(threadId)) throw Error('当前连接未返回默认模型 ID，请用 /model 明确指定模型 ID');
-    if (args.length) modelOverrides.set(threadId, args[0] === 'default' ? defaultModels.get(threadId) : args[0]);
-    $('command-feedback').textContent = `后续新一轮使用：${modelOverrides.get(threadId) || '桌面默认模型'}。模型 ID 由 App Server 在发送时校验。`;
+    if (args.length !== 1) throw Error('用法：/model 打开选择器，或 /model 模型ID');
+    const id = threadId, reset = args[0] === 'default';
+    const modelId = reset ? defaultModels.get(id) : args[0];
+    if (!modelId) throw Error('未记录首次连接的型号，请打开 /model 选择模型');
+    const catalog = await api('/api/models');
+    const model = catalog.models.find(model => model.id === modelId);
+    if (!model) throw Error('该型号不在可选目录中，请打开 /model 选择模型');
+    if (!model.defaultReasoningEffort) throw Error('目录未提供此模型的默认强度，请打开 /model 选择推理强度');
+    saveModelSetting(id, model, model.defaultReasoningEffort);
+    if (reset) $('command-feedback').textContent += ' 已重置为首次连接的型号及该型号的目录默认强度。';
   } else if (name === '/status') {
     $('command-feedback').textContent = `${connected ? '已连接' : '未连接'} · ${threadId ? $('conversation-title').textContent : '未选择会话'} · ${active[threadId] ? '正在执行' : '空闲'}`;
-    const task = threads.get(threadId);
-    const rows = [
-      ['连接', connected ? '已连接' : '未连接'],
-      ['任务', threadId ? $('conversation-title').textContent : '未选择任务'],
-      ['工作目录', task?.cwd || '未提供'],
-      ['执行状态', !threadId ? '未选择任务' : active[threadId] ? '正在执行' : '空闲'],
-      ['模型', modelOverrides.get(threadId) || defaultModels.get(threadId) || '桌面默认（未返回型号）'],
-      ...statusRows(),
-    ];
-    $('status-details').replaceChildren(...rows.map(([label, value]) => {
-      const row = document.createElement('p'); row.textContent = `${label}：${value}`; return row;
-    }));
+    renderStatus();
     if (!$('status-dialog').open) $('status-dialog').showModal();
   } else if (name === '/goal') await goals.open(args.join(' '));
   else if (name === '/rename' || name === '/compact') {
@@ -866,7 +1108,7 @@ async function executeSlash(text, preserveDraft = false) {
     if (!active[threadId]) throw Error('当前没有正在执行的任务');
     await $('stop').onclick();
   } else if (name === '/approvals') {
-    $('approvals').scrollIntoView({ behavior: 'smooth' });
+    locateApproval();
     $('command-feedback').textContent = $('jump-approvals').hidden ? '当前没有待审批请求' : $('jump-approvals').textContent;
   } else if (name === '/new') $('new').click();
   else if (name === '/resume') $('choose-task').click();
@@ -884,7 +1126,7 @@ function statusRows() {
   return [
     ['审批策略', show(status.approvalPolicy)], ['授权审核', show(status.approvalsReviewer)],
     ['权限模式', show(status.activePermissionProfile?.id ?? status.sandbox?.type)],
-    ['推理强度', show(status.reasoningEffort)],
+    ['当前推理强度（最近同步）', show(effortLabel(status.reasoningEffort))],
     ['本轮上下文 Token', show(status.tokenUsage?.last?.totalTokens)],
     ['上下文窗口', show(status.tokenUsage?.modelContextWindow)],
     ['历史加载', paginatedHistory ? '分页加载，可查看更早消息' : '最近 10 轮；桥接更新后可加载更早消息'],
@@ -893,29 +1135,83 @@ function statusRows() {
 function renderStatus() {
   const rows = [['连接', connected ? '已连接' : '未连接'], ['任务', threads.get(threadId)?.name || $('conversation-title').textContent],
     ['工作目录', threads.get(threadId)?.cwd ?? '未知'], ['执行状态', active[threadId] ? '正在执行' : '空闲'],
-    ['实际模型', taskStatus.get(threadId)?.model ?? defaultModels.get(threadId) ?? '未知'],
-    ['下轮模型设置', modelOverrides.get(threadId) ?? '沿用桌面设置'], ...statusRows()];
+    ['当前模型（最近同步）', currentModelSetting(threadId).model ?? '未知'],
+    ['下轮模型与强度', pendingModelLabel(threadId) || '沿用会话设置'], ...statusRows()];
   $('status-details').replaceChildren(...rows.map(([label, value]) => { const p = document.createElement('p'); p.textContent = `${label}：${value}`; return p; }));
 }
 
-function renderApprovals(requests) {
-  const relevant = requests.filter(r => r.params.threadId === threadId);
-  $('jump-approvals').hidden = relevant.length === 0;
-  $('jump-approvals').textContent = `${relevant.length} 项请求等待你处理`;
-  const signature = JSON.stringify(relevant);
+function locateApproval() {
+  const card = $('approvals').querySelector('.approval-card');
+  if (!card) return;
+  followingLatest = false;
+  cancelAnimationFrame(scrollFrame);
+  card.scrollIntoView({ block: 'start' });
+  card.focus({ preventScroll: true });
+}
+
+function renderApprovalReminders() {
+  const entries = pendingApprovals.entries();
+  const current = entries.get(threadId);
+  const label = approvalLabel(current);
+  $('approval-reminder').hidden = !current;
+  $('approval-reminder-text').textContent = label;
+  $('open-current-approval').disabled = selecting;
+  $('open-current-approval').textContent = current?.uncertain ? '核对请求' : current && (current.desktop.length || current.requests.some(request => !isAnswerable(request))) ? '查看详情' : '去处理';
+  $('pending-count').hidden = !entries.size;
+  $('pending-count').textContent = entries.size;
+  $('choose-task').setAttribute('aria-label', entries.size ? `打开会话侧栏，${entries.size} 个会话待处理${connected ? '' : '，状态待核对'}` : '打开会话侧栏');
+  $('pending-tasks').hidden = !entries.size;
+  $('pending-title').textContent = `待处理 · ${entries.size} 个会话${connected ? '' : ' · 连接中断，状态待核对'}`;
+  const busy = selecting || sending || stopping || slashBusy || creating;
+  const signature = JSON.stringify([[...entries.values()].map(entry => [entry.id, approvalLabel(entry), threads.get(entry.id)?.name, threads.get(entry.id)?.preview]), busy, connected]);
+  if (signature !== pendingListSignature) {
+    pendingListSignature = signature;
+    $('pending-task-list').replaceChildren(...[...entries.values()].map(entry => {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'pending-task secondary';
+      button.dataset.pendingThread = entry.id;
+      const title = document.createElement('strong');
+      title.textContent = threads.get(entry.id)?.name || threads.get(entry.id)?.preview || (entry.id ? `会话 ${entry.id}` : '未归属请求 · 请在桌面核对');
+      const status = document.createElement('span'); status.textContent = approvalLabel(entry);
+      button.append(title, status);
+      button.disabled = busy || !connected || !entry.id;
+      button.onclick = async () => {
+        try {
+          if (entry.id !== threadId) await select(entry.id);
+          $('task-dialog').close();
+          locateApproval();
+        } catch (error) { $('pending-error').textContent = `无法打开会话，请在桌面核对：${error.message}`; }
+      };
+      return button;
+    }));
+  }
+  for (const article of approvalCards.values()) {
+    for (const control of article.querySelectorAll('button, input, select')) control.disabled = !connected || selecting || article.dataset.responding === 'true';
+  }
+}
+
+function renderApprovals() {
+  const requests = pendingApprovals.requests;
+  const retained = new Set(requests.map(request => JSON.stringify(request)));
+  for (const key of approvalCards.keys()) if (!retained.has(key)) approvalCards.delete(key);
+  const relevant = requests.filter(r => r.params?.threadId === threadId);
+  const pending = pendingApprovals.get(threadId);
+  $('jump-approvals').hidden = !pending;
+  $('jump-approvals').textContent = approvalLabel(pending);
+  renderApprovalReminders();
+  const signature = JSON.stringify([threadId, relevant, pending?.desktop, pending?.uncertain]);
   if (signature === approvalSignature) return;
   approvalSignature = signature;
   const cards = [];
-  const retained = new Set();
   for (const request of relevant) {
     const key = JSON.stringify(request);
-    retained.add(key);
     if (approvalCards.has(key)) { cards.push(approvalCards.get(key)); continue; }
     const article = document.createElement('article');
     article.className = 'approval-card';
+    article.tabIndex = -1;
+    article.dataset.requestId = String(request.id);
     const heading = document.createElement('h2');
     const isQuestion = request.method === 'item/tool/requestUserInput';
-    heading.textContent = isQuestion ? '需要你的回答' : request.method === 'item/fileChange/requestApproval' ? '允许修改文件？' : '允许执行命令？';
+    heading.textContent = !isAnswerable(request) ? '需在桌面处理' : isQuestion ? '需要你的回答' : request.method === 'item/fileChange/requestApproval' ? '允许修改文件？' : '允许执行命令？';
     article.append(heading);
     for (const [label, value] of [['原因', request.params.reason], ['工作目录', request.params.cwd], ['命令', request.params.command], ['申请写入目录', request.params.grantRoot]]) {
       if (!value) continue;
@@ -937,8 +1233,9 @@ function renderApprovals(requests) {
     const feedback = document.createElement('p'); feedback.setAttribute('role', 'status');
     let responding = false;
     const respond = async result => {
-      if (responding) return;
+      if (responding || !connected || selecting || threadId !== request.params.threadId || !pendingApprovals.requests.some(current => JSON.stringify(current) === key)) return;
       responding = true;
+      article.dataset.responding = 'true';
       const controls = [...article.querySelectorAll('button, input, select')];
       controls.forEach(control => { control.disabled = true; });
       feedback.textContent = '正在提交…';
@@ -946,10 +1243,13 @@ function renderApprovals(requests) {
       catch (error) {
         feedback.textContent = `提交未确认：${error.message}。请等待状态刷新后核对。`;
         responding = false;
-        controls.forEach(control => { control.disabled = false; });
+        article.dataset.responding = 'false';
+        renderApprovalReminders();
       }
     };
-    if (isQuestion) {
+    if (!isAnswerable(request)) {
+      feedback.textContent = '此请求暂不支持在手机处理，请打开桌面 Codex 核对。';
+    } else if (isQuestion) {
       const form = document.createElement('form');
       const inputs = [];
       for (const question of request.params.questions) {
@@ -993,8 +1293,19 @@ function renderApprovals(requests) {
     approvalCards.set(key, article);
     cards.push(article);
   }
-  for (const key of approvalCards.keys()) if (!retained.has(key)) approvalCards.delete(key);
-  $('approvals').replaceChildren(...cards);
+  if (pending?.desktop.length) {
+    const card = document.createElement('article'); card.className = 'approval-card'; card.tabIndex = -1;
+    const heading = document.createElement('h2'); heading.textContent = '需在桌面处理';
+    const detail = document.createElement('p');
+    detail.textContent = pending.uncertain ? '上次检测到此会话在等待处理，当前状态待同步。请在桌面 Codex 核对。' : `${pending.desktop.includes('waitingOnApproval') ? '此会话正在等待批准' : '此会话正在等待回答'}。手机尚未收到可操作的请求，请在桌面 Codex 处理。`;
+    card.append(heading, detail); cards.push(card);
+  }
+  // Removing a sibling request must not detach the form the user is typing in.
+  for (const card of [...$('approvals').children]) if (!cards.includes(card)) card.remove();
+  cards.forEach((card, index) => {
+    if ($('approvals').children[index] !== card) $('approvals').insertBefore(card, $('approvals').children[index] ?? null);
+  });
+  renderApprovalReminders();
 }
 
 async function poll() {
@@ -1015,6 +1326,10 @@ async function poll() {
     if (state.bridgeId) bridgeId = state.bridgeId;
     if (!connected || changed) tasksLoaded = false;
     active = state.active ?? {};
+    pendingApprovals.snapshot(state, changed);
+    if (changed) { approvalCards.clear(); approvalSignature = ''; }
+    renderApprovals();
+    updateControls();
     const created = delivery.createdNaming;
     if (created && !freshThreads.has(created.threadId)) freshThreads.set(created.threadId, { id: created.threadId, cwd: created.cwd, projectId: created.projectId, turns: [] });
     if (connected) await recoverSubmission();
@@ -1048,6 +1363,17 @@ async function poll() {
     for (const event of state.events) {
       goals.event(event);
       if (event.method === 'thread/name/updated' && event.params?.threadId) applyTaskName(event.params.threadId, event.params.threadName ?? '', false);
+      if (event.method === 'thread/settings/updated' && event.params?.threadId) {
+        const id = event.params.threadId, settings = event.params.threadSettings;
+        if (settings) {
+          modelSettingVersions.set(id, (modelSettingVersions.get(id) ?? 0) + 1);
+          rememberThreadStatus(id, { model: settings.model ?? null, reasoningEffort: settings.effort ?? null });
+          if ($('model-dialog').open && $('model-dialog').dataset.threadId === id && id === threadId) {
+            renderModelCurrent();
+            if (modelCatalog && !modelLoading && !modelDraftChanged && !modelOverrides.has(id)) { $('model-error').textContent = ''; renderModelChoices(currentModelSetting(id)); }
+          }
+        }
+      }
       if (event.params?.threadId !== currentThread) continue;
       if (!hydrating) timeline.event(event);
       if (event.method === 'thread/tokenUsage/updated') taskStatus.set(currentThread, { ...taskStatus.get(currentThread), tokenUsage: event.params.tokenUsage });
@@ -1077,16 +1403,17 @@ async function poll() {
     }
     if (currentThread && selected === selection) renderHistory(timeline.thread(currentThread), true);
     cursor = state.cursor;
-    renderApprovals(state.approvals);
     updateControls();
     if (followingLatest) scrollToLatest();
   } catch (error) {
     if (!stateReceived) {
       connected = false;
+      pendingApprovals.disconnect();
+      renderApprovals();
       tasksLoaded = false;
       $('status').textContent = '连接中断 · 正在重连';
-    }
-    showError(error);
+      $('connection-error').textContent = error.message ?? String(error);
+    } else showError(error);
   } finally {
     polling = false;
     updateControls();
@@ -1139,7 +1466,8 @@ $('quick-menu').addEventListener('click', event => {
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') { $('quick-menu').hidden = true; $('quick-toggle').setAttribute('aria-expanded', 'false'); }
 });
-$('jump-approvals').onclick = () => $('approvals').scrollIntoView();
+$('jump-approvals').onclick = locateApproval;
+$('open-current-approval').onclick = locateApproval;
 $('close-tasks').onclick = () => $('task-dialog').close();
 $('task-search').oninput = renderTasks;
 $('search-all').onclick = async () => {
@@ -1219,6 +1547,7 @@ $('new-form').onsubmit = async event => {
     preferences.rememberWorkspace(project?.id ?? '', cwd);
     if (project) projectAssignments[result.thread.id] = project.id;
     if (result.model) defaultModels.set(result.thread.id, result.model);
+    rememberThreadStatus(result.thread.id, result);
     freshThreads.set(result.thread.id, result.thread);
     await select(result.thread.id);
     $('new-dialog').close();
@@ -1265,6 +1594,7 @@ async function send(steer, quickText) {
   if (uncertainSubmission) throw Error('上次提交结果待确认，请先查询发送结果');
   if (!connected || !threadId || (!text.trim() && !composerAttachments.hasImages())) throw new Error('请选择任务并输入指令或添加图片');
   sending = true;
+  submittedModelSetting = !steer && modelOverrides.has(threadId) ? { id: threadId, setting: modelOverrides.get(threadId) } : null;
   submittedDraft = quickText === undefined ? { threadId, text, media: composerAttachments.capture() } : null;
   updateControls();
   try {
@@ -1272,8 +1602,9 @@ async function send(steer, quickText) {
     await command(steer ? 'turn/steer' : 'turn/start', {
       threadId, input: [...(text.trim() ? [{ type: 'text', text }] : []), ...attachments],
       ...(steer ? { expectedTurnId: active[threadId] } : {}),
-      ...(!steer && modelOverrides.get(threadId) ? { model: modelOverrides.get(threadId) } : {}),
+      ...(submittedModelSetting?.setting ?? {}),
     });
+    finishModelSubmission(true);
     freshThreads.delete(threadId);
     deliveryOutcomes.set(threadId, '已接收');
     if (submittedDraft) composerAttachments.clear(submittedDraft.media);
@@ -1285,7 +1616,7 @@ async function send(steer, quickText) {
     $('error').textContent = '';
   } catch (error) {
     deliveryOutcomes.set(threadId, uncertainSubmission ? '结果待确认' : '发送失败，文字和图片已保留');
-    if (!uncertainSubmission) submittedDraft = null;
+    if (!uncertainSubmission) { submittedDraft = null; finishModelSubmission(false); }
     throw error;
   } finally { sending = false; updateControls(); }
 }

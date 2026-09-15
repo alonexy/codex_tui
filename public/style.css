@@ -102,6 +102,19 @@ main { max-width: 800px; padding-top: 4px; }
 .message-body { font-size: 16px; line-height: 1.75; }
 .tool-record { border: 0; border-left: 2px solid #444; padding: 0 12px; margin: 12px 0; font-size: .85rem; color: var(--muted); }
 .tool-record pre { font-size: .75rem; }
+.turn-process { border: 1px solid var(--border); border-radius: 12px; padding: 0 12px; margin: 12px 0; color: var(--muted); font-size: .85rem; }
+.turn-process > summary { min-height: 48px; padding: 12px 0; line-height: 1.6; }
+.process-title { font-weight: 500; }
+.process-action, .process-error { display: block; margin-top: 4px; }
+.process-action { color: var(--text); }
+.process-attention > summary, .process-error { color: var(--danger); }
+.process-list { border-top: 1px solid var(--border); padding: 4px 0 8px; }
+.process-list > .message { margin: 8px 0; padding: 4px 0; }
+.process-list .message-body { margin-top: 4px; font-size: .85rem; line-height: 1.65; }
+.process-list > .tool-record { padding: 0 0 0 10px; margin: 4px 0; }
+.process-list > .tool-record > summary { min-height: 44px; padding: 10px 0; }
+.process-list pre { max-width: 100%; max-height: 300px; overflow: auto; }
+.turn-process { scroll-margin-top: calc(84px + env(safe-area-inset-top)); }
 .output { border: 0; padding: 0; margin: 16px 0; }
 .output h1 { font-size: .8rem; font-weight: 400; color: var(--muted); }
 #events { min-height: 0; }
@@ -122,11 +135,15 @@ main { max-width: 800px; padding-top: 4px; }
 #attach-image, #voice-input, #slash-toggle { border: 0; background: transparent; color: var(--text); }
 #model-label { overflow-wrap: anywhere; margin: 4px 10px; }
 #model-label:empty { display: none; }
+#model-dialog { width: min(460px, calc(100vw - 24px)); }
+#model-dialog p { margin: 8px 0; }
+#model-dialog select { text-overflow: ellipsis; }
+#model-dialog .error:empty, #model-description:empty, #effort-description:empty { display: none; }
 #send { color: #111; }
 @media (max-width: 380px) { main { padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); } .composer-tools { --control-size: 44px; gap: 2px; } }
 #stop { font-size: 17px; background: #444; border: 0; color: var(--text); }
 #quick-toggle { border: 0; background: transparent; color: var(--muted); }
-#quick-menu { display: flex; justify-content: flex-end; gap: 8px; padding: 8px 0; }
+#quick-menu { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 8px 0; }
 #quick-menu button { min-height: 40px; padding: 6px 16px; background: var(--surface); color: var(--text); }
 #turn-loading { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: .8rem; margin: 12px 0; }
 .loading-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: loading-pulse 1s ease-in-out infinite alternate; }
@@ -172,3 +189,19 @@ main { max-width: 800px; padding-top: 4px; }
 #recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 #recovery-actions button { flex: 1 1 140px; margin: 4px 0; }
 .device-card, .audit-record { overflow-wrap: anywhere; }
+#choose-task { position: relative; }
+#pending-count { position: absolute; top: 0; right: 0; min-width: 20px; border-radius: 12px; padding: 0 4px; color: #30220c; background: #f4d49a; font-size: 11px; font-weight: 700; }
+#approval-reminder { display: flex; align-items: center; gap: 10px; padding: 8px 10px; margin-bottom: 8px; border: 1px solid #8d7345; border-radius: 14px; background: #332c20; color: #f4d49a; }
+#approval-reminder-text { flex: 1; min-width: 0; font-size: .8rem; line-height: 1.5; }
+#open-current-approval { flex: 0 0 auto; min-height: 44px; padding: 8px 12px; border-color: #bfa26b; background: #f4d49a; color: #30220c; font-size: .8rem; }
+.approval-card { scroll-margin-top: calc(84px + env(safe-area-inset-top)); }
+.approval-card:focus { outline: 2px solid #f4d49a; outline-offset: 3px; }
+.task-state[data-state="waiting"], .pending-badge { color: #f4d49a; }
+.pending-badge { display: inline-block; font-size: .7rem; font-weight: 500; margin-left: 8px; padding: 2px 7px; border: 1px solid #78633e; border-radius: 10px; }
+#pending-tasks { margin: 16px 0; padding: 12px; border: 1px solid #78633e; border-radius: 12px; }
+#pending-tasks h3 { margin: 0; font-size: .9rem; color: #f4d49a; }
+#pending-tasks p { margin: 6px 0; }
+.pending-task { display: block; width: 100%; text-align: left; min-height: 44px; margin-top: 8px; padding: 10px; }
+.pending-task strong, .pending-task span { display: block; }
+.pending-task strong { font-size: .85rem; }
+.pending-task span { font-size: .75rem; color: #f4d49a; margin-top: 4px; }

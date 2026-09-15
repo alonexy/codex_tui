@@ -22,6 +22,7 @@ try {
       else if (body.method === 'thread/goal/set') { goal = { tokensUsed: 12, timeUsedSeconds: 3, ...goal, ...body.params }; result = { goal }; }
       else if (body.method === 'thread/goal/clear') { goal = null; result = {}; }
       else if (body.method === 'thread/items/list') result = { data: thread.turns.flatMap(turn => turn.items.map(item => ({ turnId: 'turn', item: active.task && item.id === 'mobile-message' ? { ...item, id: 'item-2' } : item }))).reverse(), nextCursor: null };
+      else if (body.method === 'thread/turns/list') result = { data: [], nextCursor: null };
       else if (body.method === 'turn/interrupt') { active = {}; events.push({ cursor: ++cursor, method: 'turn/completed', params: { threadId: 'task', turn: { id: 'turn', status: 'interrupted' } } }); result = {}; }
       else if (body.method === 'turn/start') {
         thread.turns.push({ items: [{ id: 'mobile-message', type: 'userMessage', content: body.params.input }] });

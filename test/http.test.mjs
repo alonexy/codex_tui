@@ -2,6 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Broker } from '../src/broker.mjs';
 import { createWebServer } from '../src/http.mjs';
+import { desktopModels } from '../src/models.mjs';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 test('HTTP authentication, origin checks, receipts and reconnect state', async t => {
   const sent = [];
@@ -15,6 +19,7 @@ test('HTTP authentication, origin checks, receipts and reconnect state', async t
   const headers = { Origin: 'https://phone.example', 'Content-Type': 'application/json' };
   assert.equal((await fetch(`${base}/api/state`)).status, 401);
   assert.equal((await fetch(`${base}/app.js`)).status, 401);
+  assert.equal((await fetch(`${base}/approval-state.js`)).status, 401);
   assert.equal((await fetch(`${base}/index.html`)).status, 401);
   assert.equal((await fetch(`${base}/api/state`, { headers: { Authorization: `Bearer ${password}` } })).status, 401);
   assert.equal((await fetch(`${base}/api/state`, { headers: { ...headers, Origin: 'https://other.example' } })).status, 403);
@@ -55,6 +60,9 @@ test('HTTP authentication, origin checks, receipts and reconnect state', async t
   headers.Cookie = cookie.split(';')[0];
   assert.match(await (await fetch(base, { headers })).text(), /id="workspace"/);
   assert.equal((await fetch(`${base}/app.js`, { headers })).status, 200);
+  const approvalModule = await fetch(`${base}/approval-state.js`, { headers });
+  assert.equal(approvalModule.status, 200);
+  assert.match(approvalModule.headers.get('content-type'), /text\/javascript/);
   const payload = { key: 'phone-001', method: 'thread/list', params: {} };
   for (let i = 0; i < 2; i++) {
     assert.equal((await fetch(`${base}/api/commands`, { method: 'POST', headers, body: JSON.stringify(payload) })).status, 202);
@@ -113,4 +121,40 @@ test('only configured proxy can supply individual login identities', async t => 
   for (let i = 0; i < 5; i++) assert.equal((await login('192.0.2.1', 'wrong')).status, 401);
   assert.equal((await login('::ffff:c000:201')).status, 429, 'mapped IPv4 must share the same bucket');
   assert.equal((await login('192.0.2.2')).status, 200);
+});
+
+test('model catalog is authenticated, filtered, rereadable and has safe failure responses', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'http-model-catalog-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'models_cache.json');
+  const origin = 'http://127.0.0.1:8787', password = 'test-password-not-production';
+  let reads = 0;
+  const server = createWebServer(new Broker(() => { throw Error('catalog must not call RPC'); }), { password, origin, readModels: () => { ++reads; return desktopModels({ path }); } });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  assert.equal((await fetch(`${base}/api/models`)).status, 401);
+  assert.equal(reads, 0);
+  const headers = { Origin: origin, 'Content-Type': 'application/json' };
+  const login = await fetch(`${base}/api/login`, { method: 'POST', headers, body: JSON.stringify({ password }) });
+  headers.Cookie = login.headers.get('set-cookie').split(';')[0];
+  const getModels = () => fetch(`${base}/api/models`, { headers });
+  for (const content of [null, '{ private-instructions', '{"models":null}']) {
+    if (content !== null) await writeFile(path, content);
+    const response = await getModels();
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(JSON.stringify(await response.json()), /http-model-catalog|ENOENT|private-instructions/);
+  }
+  const visible = { slug: 'model-a', display_name: 'Model A', description: 'Description', visibility: 'list', default_reasoning_level: 'high', supported_reasoning_levels: [{ effort: 'high', description: 'High' }], model_messages: { secret: 'private-instructions' } };
+  await writeFile(path, JSON.stringify({ fetched_at: '2020-01-01T00:00:00Z', api_key: 'secret', models: [visible, { ...visible, slug: 'hidden', visibility: 'hide' }] }));
+  const response = await getModels();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const catalog = await response.json();
+  assert.equal(catalog.stale, true);
+  assert.deepEqual(Object.keys(catalog), ['source', 'fetchedAt', 'stale', 'models']);
+  assert.deepEqual(catalog.models, [{ id: 'model-a', displayName: 'Model A', description: 'Description', defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ effort: 'high', description: 'High' }] }]);
+  assert.doesNotMatch(JSON.stringify(catalog), /secret|instructions|hidden/);
+  await writeFile(path, JSON.stringify({ fetched_at: new Date().toISOString(), models: [] }));
+  assert.deepEqual((await (await getModels()).json()).models, []);
 });

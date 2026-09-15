@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { HistoryPages } from '../public/history-pages.js';
-import { Timeline } from '../public/timeline.js';
+import { Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary } from '../public/timeline.js';
 import { DeliveryState, deliveryLabel } from '../public/delivery-state.js';
 import { taskPreferences } from '../public/task-preferences.js';
+import { ApprovalState, approvalLabel, isAnswerable } from '../public/approval-state.js';
 
 function composer(storage = { getItem() { return null; }, setItem() {} }, session = { removeItem() {}, getItem() { return null; }, setItem() {} }) {
   const elements = new Map();
@@ -23,6 +24,12 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     setAttribute(name, value) { this[name] = value; }
     getAttribute(name) { return this[name]; }
     append(...nodes) { this.children.push(...nodes); }
+    insertBefore(node, reference) {
+      node.parentNode?.removeChild(node);
+      const index = reference ? this.children.indexOf(reference) : this.children.length;
+      this.children.splice(index, 0, node); node.parentNode = this;
+    }
+    removeChild(node) { this.children.splice(this.children.indexOf(node), 1); node.parentNode = null; }
     replaceChildren(...nodes) { this.text = ''; this.children = nodes; }
     querySelectorAll(selector) {
       const matches = node => selector.startsWith('.') ? node.className.split(' ').includes(selector.slice(1))
@@ -42,7 +49,7 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     return elements.get(id);
   };
   const context = vm.createContext({
-    document: { getElementById: get, addEventListener() {}, createElement: tag => new Element(tag), body: new Element('body') },
+    document: { getElementById: get, addEventListener() {}, createElement: tag => new Element(tag), createTextNode: text => Object.assign(new Element(), { textContent: text }), body: new Element('body') },
     window: { addEventListener() {} },
     sessionStorage: session,
     Option: function(text, value) { const option = new Element('option'); option.textContent = text; option.value = value; return option; },
@@ -50,8 +57,9 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     cancelAnimationFrame() {}, requestAnimationFrame() {},
     composerMedia: () => ({ render() {}, reading: () => false, hasImages: () => false, input: async () => [], capture: () => ({ threadId: 'thread-1', items: [] }), clear() {} }),
     HistoryPages,
-    Timeline,
+    Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary,
     DeliveryState, deliveryLabel, devicePanel: () => {},
+    ApprovalState, approvalLabel, isAnswerable,
     taskPreferences: () => taskPreferences(storage),
     goalPanel: () => ({ open: async () => {}, event() {} }),
   });
@@ -61,6 +69,41 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
   run("connected = true; threadId = 'thread-1';");
   return { get, run };
 }
+
+test('each turn retains one disclosure through completion, refresh and thread switches', () => {
+  const { get, run } = composer();
+  run(`globalThis.sample = { id: 'thread-1', turns: [{ id: 'turn', status: 'inProgress', items: [
+    { id: 'user', type: 'userMessage', content: [{ type: 'text', text: '请检查' }] },
+    { id: 'progress', type: 'agentMessage', phase: 'commentary', text: '正在检查' },
+    { id: 'tool', type: 'commandExecution', command: 'npm test', status: 'inProgress', aggregatedOutput: 'testing' },
+    { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: '最终回复' },
+    { id: 'unknown', type: 'agentMessage', phase: null, text: '兼容正文' },
+    { id: 'question', type: 'agentMessage', phase: 'commentary', questions: [{ id: 'q' }], text: '请选择方案' }
+  ] }] }; renderHistory(sample);`);
+  const section = get('history').children[0];
+  const process = section.querySelector('.turn-process');
+  assert.equal(section.querySelectorAll('.turn-process').length, 1);
+  assert.equal(process.open, false);
+  assert.equal(process.querySelectorAll('.agentMessage').length, 1);
+  assert.equal(section.children.filter(node => node.className.includes('agentMessage')).length, 3);
+  const tool = process.querySelector('.tool-record');
+  assert.equal(tool.querySelector('pre'), null, 'raw output is lazy');
+  process.open = true; tool.open = true; tool.ontoggle();
+  run(`sample.turns[0].status = 'completed'; sample.turns[0].durationMs = 2000;
+    sample.turns[0].items[2].aggregatedOutput = 'done'; renderHistory(sample);`);
+  assert.equal(get('history').children[0], section);
+  assert.equal(section.querySelector('.turn-process'), process);
+  assert.equal(process.open, true);
+  assert.equal(process.querySelector('.tool-record'), tool);
+  assert.equal(tool.open, true);
+  assert.match(tool.querySelector('pre').textContent, /done/);
+  assert.match(process.children[0].textContent, /已完成 · 用时 2 秒/);
+  run(`renderHistory({ ...sample, id: 'thread-2' });`);
+  assert.equal(get('history').querySelector('.turn-process').open, false);
+  run('renderHistory(sample)');
+  assert.equal(get('history').querySelector('.turn-process'), process);
+  assert.equal(process.open, true);
+});
 
 test('composer swaps send for stop and shows inline loading through the turn lifecycle', () => {
   const { get, run } = composer();
@@ -389,19 +432,277 @@ test('old bridges reject named creation before starting but retain blank-name cr
   assert.equal(run('calls[0].method'), 'thread/start');
 });
 
-test('model forms apply to later turns and slash errors reach the send caller', async () => {
+const modelDirectory = { source: 'desktop-cache', fetchedAt: '2026-09-15T01:00:00Z', stale: false, models: [
+  { id: 'desktop-model', displayName: 'Desktop Model', description: 'Original model', defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ effort: 'medium', description: 'Balanced' }, { effort: 'high', description: 'More reasoning' }] },
+  { id: 'selected-model', displayName: 'Selected Model', description: 'Another model', defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ effort: 'low', description: 'Fast' }, { effort: 'future-effort', description: 'Future option' }] },
+] };
+function setupModels(app) {
+  app.run(`const catalogFixture = ${JSON.stringify(modelDirectory)}; api = async () => catalogFixture;
+    defaultModels.set(threadId, 'desktop-model'); taskStatus.set(threadId, { model: 'desktop-model', reasoningEffort: 'high' });
+    command = async (method, params) => {
+      if (method !== 'thread/read') throw Error('Unexpected fixture RPC: ' + method);
+      return { thread: { id: params.threadId, model: taskStatus.get(params.threadId)?.model ?? null, reasoningEffort: taskStatus.get(params.threadId)?.reasoningEffort ?? null } };
+    };`);
+}
+
+test('model picker links supported efforts, preserves drafts and resets both fields explicitly', async () => {
   const { get, run } = composer();
+  setupModels({ run });
   get('message').value = '消息草稿';
-  run("defaultModels.set(threadId, 'desktop-model'); openCommandForm('/model')");
-  get('command-argument').value = 'selected-model';
-  await get('command-form').onsubmit({ preventDefault() {} });
-  assert.equal(run('modelOverrides.get(threadId)'), 'selected-model');
+  await run("openCommandForm('/model')");
+  assert.equal(get('model-choice').value, 'desktop-model');
+  assert.equal(get('effort-choice').value, 'high');
+  get('model-choice').value = 'selected-model'; get('model-choice').onchange();
+  assert.equal(get('effort-choice').value, 'low', 'changing model must discard unsupported old effort');
+  assert.deepEqual(get('effort-choice').options.map(option => option.value), ['low', 'future-effort']);
+  assert.equal(get('effort-description').textContent, 'Fast');
+  assert.match(get('effort-choice').options[0].textContent, /低（模型默认）/);
+  await get('model-form').onsubmit({ preventDefault() {} });
+  assert.equal(run('JSON.stringify(modelOverrides.get(threadId))'), JSON.stringify({ model: 'selected-model', effort: 'low' }));
+  assert.equal(run('taskStatus.get(threadId).model'), 'desktop-model');
+  assert.equal(run('taskStatus.get(threadId).reasoningEffort'), 'high');
   assert.equal(get('message').value, '消息草稿');
+  assert.match(get('model-label').textContent, /下轮.*selected-model.*低/);
+  await run("runSlash('/status')");
+  assert.match(get('status-details').textContent, /当前模型（最近同步）：desktop-model.*下轮模型与强度：下轮（尚未发送）：selected-model · 低/);
+  get('status-dialog').close();
   await run("runSlash('/model default')");
-  assert.equal(run('modelOverrides.get(threadId)'), 'desktop-model');
+  assert.equal(run('JSON.stringify(modelOverrides.get(threadId))'), JSON.stringify({ model: 'desktop-model', effort: 'medium' }));
+  assert.match(get('command-feedback').textContent, /首次连接的型号及该型号的目录默认强度/);
+  await assert.rejects(run("runSlash('/model unknown')"), /不在可选目录/);
+  assert.equal(run('modelOverrides.get(threadId).effort'), 'medium');
   get('message').value = '/rename 标题';
   await assert.rejects(run('send(false)'), /驻留桥接/);
   assert.equal(get('message').value, '/rename 标题');
+});
+
+test('cancel and session switches keep model choices isolated', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  await run("runSlash('/model selected-model')");
+  await run("openCommandForm('/model')");
+  get('model-choice').value = 'desktop-model'; get('model-choice').onchange();
+  get('model-cancel').click();
+  assert.equal(run('modelOverrides.get(threadId).model'), 'selected-model');
+  await run("openCommandForm('/model')");
+  assert.equal(get('model-choice').value, 'selected-model');
+  get('model-cancel').click();
+  await run("threadId = 'other'; taskStatus.set(threadId, { model: 'desktop-model', reasoningEffort: 'medium' }); openCommandForm('/model')");
+  assert.equal(get('model-choice').value, 'desktop-model');
+  assert.equal(get('effort-choice').value, 'medium');
+  get('model-form').onsubmit({ preventDefault() {} });
+  assert.equal(run("modelOverrides.get('thread-1').model"), 'selected-model');
+  assert.equal(run("modelOverrides.get('other').model"), 'desktop-model');
+});
+
+test('failed, empty, stale and unknown catalogs never fabricate choices and can retry', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  await run("api = async () => { throw Error('目录暂不可用'); }; openCommandForm('/model')");
+  assert.match(get('model-error').textContent, /目录暂不可用/);
+  assert.equal(get('model-save').disabled, true);
+  assert.equal(run('modelOverrides.size'), 0);
+  run("api = async () => ({ ...catalogFixture, models: [] });");
+  await get('model-reload').click();
+  assert.match(get('model-error').textContent, /没有可展示/);
+  assert.equal(get('model-save').disabled, true);
+  get('model-cancel').click();
+  await run("taskStatus.set(threadId, { model: 'outside-catalog', reasoningEffort: 'unlisted' }); api = async () => ({ ...catalogFixture, stale: true }); openCommandForm('/model')");
+  assert.match(get('model-error').textContent, /outside-catalog.*支持强度未知/);
+  assert.match(get('model-source').textContent, /上次同步.*过期/);
+  assert.equal(get('model-choice').value, '');
+  assert.equal(get('model-save').disabled, true);
+  get('model-choice').value = 'selected-model'; get('model-choice').onchange();
+  assert.equal(get('effort-choice').value, 'low');
+  get('effort-choice').value = 'future-effort'; get('effort-choice').onchange();
+  get('model-form').onsubmit({ preventDefault() {} });
+  assert.equal(run('modelOverrides.get(threadId).effort'), 'future-effort');
+  await run("api = async () => ({ ...catalogFixture, models: [{ ...catalogFixture.models[1], supportedReasoningEfforts: [], defaultReasoningEffort: null }] }); openCommandForm('/model')");
+  assert.equal(get('model-save').disabled, true);
+  assert.equal(get('effort-choice').value, '');
+  await run("api = async () => ({ ...catalogFixture, models: [{ ...catalogFixture.models[1], supportedReasoningEfforts: [{ effort: 'low', description: 'Fast' }], defaultReasoningEffort: null }] }); openCommandForm('/model')");
+  assert.equal(get('model-save').disabled, true, 'missing default must require an explicit effort choice');
+  get('effort-choice').value = 'low'; get('effort-choice').onchange();
+  assert.equal(get('model-save').disabled, false);
+  get('model-cancel').click();
+  await assert.rejects(run("runSlash('/model selected-model')"), /未提供.*默认强度/);
+  assert.equal(run('modelOverrides.get(threadId).effort'), 'future-effort');
+});
+
+test('late model responses cannot replace a reopened dialog or a different session', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  run('const responses = []; api = () => new Promise((resolve, reject) => responses.push({ resolve, reject }));');
+  const first = run("openCommandForm('/model')");
+  get('model-cancel').click();
+  const reopened = run("openCommandForm('/model')");
+  get('model-dialog').onclose(); // Native close events can arrive after an immediate reopen.
+  run('responses[1].resolve(catalogFixture)'); await reopened;
+  run("responses[0].reject(Error('old error'))"); await first;
+  assert.equal(get('model-choice').value, 'desktop-model');
+  assert.equal(get('model-error').textContent, '');
+  const reload = get('model-reload').click();
+  run("threadId = 'other'; updateControls()");
+  run('responses[2].resolve(catalogFixture)'); await reload;
+  assert.equal(get('model-save').disabled, true);
+  assert.equal(get('model-choice').options.some(option => option.value === 'desktop-model'), false);
+  get('model-form').onsubmit({ preventDefault() {} });
+  assert.equal(run('modelOverrides.size'), 0);
+});
+
+test('new turns send model and effort together while steer omits both, including after send failure', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  await run("runSlash('/model selected-model')");
+  run("const calls = []; command = async (method, params) => { calls.push({ method, params }); }; poll = async () => {};");
+  get('message').value = 'new turn'; await run('send(false)');
+  assert.equal(run('calls[0].method'), 'turn/start');
+  assert.equal(run('calls[0].params.model'), 'selected-model');
+  assert.equal(run('calls[0].params.effort'), 'low');
+  run("active[threadId] = 'turn-1'");
+  get('message').value = 'steer turn'; await run('send(true)');
+  assert.equal(run('calls[1].method'), 'turn/steer');
+  assert.equal(run("Object.hasOwn(calls[1].params, 'model')"), false);
+  assert.equal(run("Object.hasOwn(calls[1].params, 'effort')"), false);
+  await run("runSlash('/model selected-model')");
+  run("command = async () => { throw Error('model rejected'); }");
+  get('message').value = 'preserved after failure';
+  await assert.rejects(run('send(false)'), /model rejected/);
+  assert.equal(get('message').value, 'preserved after failure');
+  assert.equal(run('modelOverrides.get(threadId).effort'), 'low');
+});
+
+test('model picker refreshes current thread settings instead of displaying an old xhigh snapshot', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  run(`catalogFixture.models[0].supportedReasoningEfforts.push({ effort: 'xhigh', description: 'More' });
+    taskStatus.set(threadId, { model: 'desktop-model', reasoningEffort: 'xhigh' });
+    const reads = []; command = async (method, params) => {
+      reads.push({ method, params });
+      return { thread: { id: threadId, model: 'desktop-model', reasoningEffort: 'medium' } };
+    };`);
+  await run("openCommandForm('/model')");
+  assert.equal(get('effort-choice').value, 'medium', 'desktop thread is medium; opening the picker must not show old xhigh');
+  assert.equal(run('reads[0].method'), 'thread/read');
+  assert.equal(run('reads[0].params.includeTurns'), false);
+});
+
+test('desktop settings updates replace an old xhigh snapshot before the picker opens', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  run(`catalogFixture.models[0].supportedReasoningEfforts.push({ effort: 'xhigh', description: 'More' });
+    taskStatus.set(threadId, { model: 'desktop-model', reasoningEffort: 'xhigh' }); tasksLoaded = true;
+    api = async path => path === '/api/models' ? catalogFixture : { ready: true, cursor: 1, events: [
+      { method: 'thread/settings/updated', params: { threadId, threadSettings: { model: 'desktop-model', effort: 'medium' } } }
+    ] };
+    command = async () => ({ thread: { id: threadId, model: 'desktop-model', reasoningEffort: 'medium' } });`);
+  await run('poll()');
+  assert.equal(run('currentModelSetting(threadId).effort'), 'medium', 'desktop settings events must update the current configured effort');
+  await run("openCommandForm('/model')");
+  assert.equal(get('effort-choice').value, 'medium');
+});
+
+test('confirmed model submissions stop shadowing subsequent desktop settings', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  await run("runSlash('/model selected-model')");
+  run("command = async () => ({}); poll = async () => {};");
+  get('message').value = 'fixture turn'; await run('send(false)');
+  assert.equal(run('modelOverrides.has(threadId)'), false, 'an accepted setting is no longer an unsent override');
+  run("command = async () => ({ thread: { id: threadId, model: 'desktop-model', reasoningEffort: 'medium' } });");
+  await run("openCommandForm('/model')");
+  assert.equal(get('model-choice').value, 'desktop-model');
+  assert.equal(get('effort-choice').value, 'medium');
+});
+
+test('unknown current effort is not presented as the catalog default', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  run("taskStatus.set(threadId, { model: 'desktop-model', reasoningEffort: null }); command = async () => ({ thread: { id: threadId, model: 'desktop-model', reasoningEffort: null } });");
+  await run("openCommandForm('/model')");
+  assert.equal(get('effort-choice').value, '', 'unknown current effort must remain unknown until explicitly chosen');
+  assert.equal(get('model-save').disabled, true);
+});
+
+test('current settings read failures do not reuse cached effort and retry reads the thread again', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  run("command = async () => { throw Error('read unavailable'); }");
+  await run("openCommandForm('/model')");
+  assert.match(get('model-current').textContent, /未知型号.*强度未知/);
+  assert.match(get('model-error').textContent, /设置读取失败/);
+  assert.equal(get('model-choice').value, '');
+  assert.equal(get('model-save').disabled, true);
+  run("command = async () => ({ thread: { id: threadId, model: 'desktop-model', reasoningEffort: 'medium' } });");
+  await get('model-reload').click();
+  assert.equal(get('effort-choice').value, 'medium');
+});
+
+test('settings events win over older reads without overwriting an edited model draft', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  run(`let resolveRead; command = () => new Promise(resolve => { resolveRead = resolve; }); tasksLoaded = true;
+    api = async path => path === '/api/models' ? catalogFixture : { ready: true, cursor: 1, events: [
+      { method: 'thread/settings/updated', params: { threadId, threadSettings: { model: 'desktop-model', effort: 'medium' } } }
+    ] };`);
+  const opening = run("openCommandForm('/model')");
+  await run('poll()');
+  run("resolveRead({ thread: { id: threadId, model: 'desktop-model', reasoningEffort: 'high' } })"); await opening;
+  assert.equal(get('effort-choice').value, 'medium');
+  get('effort-choice').value = 'high'; get('effort-choice').onchange();
+  await run('poll()');
+  assert.equal(get('effort-choice').value, 'high', 'a desktop event updates current state, not a user-edited draft');
+  assert.match(get('model-current').textContent, /当前会话：desktop-model · 中/);
+  assert.equal(run('modelOverrides.size'), 0);
+});
+
+test('settings events remain usable when the model catalog could not load', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  run("api = async () => { throw Error('catalog unavailable'); };");
+  await run("openCommandForm('/model')");
+  run(`tasksLoaded = true; api = async () => ({ ready: true, cursor: 1, events: [
+    { method: 'thread/settings/updated', params: { threadId, threadSettings: { model: 'desktop-model', effort: 'medium' } } }
+  ] });`);
+  await run('poll()');
+  assert.match(get('model-current').textContent, /desktop-model · 中/);
+  assert.match(get('model-error').textContent, /catalog unavailable/);
+  assert.equal(get('error').textContent, '');
+  assert.equal(get('model-save').disabled, true);
+});
+
+test('native thread fields take precedence over resume defaults, including null effort', async () => {
+  const { run } = composer(); setupModels({ run });
+  run("command = async () => ({ model: 'desktop-model', reasoningEffort: 'high', thread: { id: threadId, model: 'selected-model', reasoningEffort: 'low', turns: [] } });");
+  await run('select(threadId)');
+  assert.equal(run('currentModelSetting(threadId).model'), 'selected-model');
+  assert.equal(run('currentModelSetting(threadId).effort'), 'low');
+  run("command = async () => ({ model: 'desktop-model', reasoningEffort: 'high', thread: { id: threadId, model: null, reasoningEffort: null, turns: [] } });");
+  await run('select(threadId)');
+  assert.equal(run('currentModelSetting(threadId).model'), null);
+  assert.equal(run('currentModelSetting(threadId).effort'), null);
+});
+
+test('unknown and late model receipts retain newer unsent choices and failed settings', async () => {
+  for (const status of ['completed', 'failed']) {
+    const { get, run } = composer(); setupModels({ run });
+    await run("runSlash('/model selected-model')");
+    run(`command = async () => {
+      submittedModelSetting.key = 'model-receipt'; delivery.begin('model-receipt', 'turn/start', threadId);
+      uncertainSubmission = true; throw Error('receipt unavailable');
+    };`);
+    get('message').value = 'fixture turn'; await assert.rejects(run('send(false)'), /receipt unavailable/);
+    assert.equal(run('modelOverrides.get(threadId).model'), 'selected-model');
+    assert.match(get('model-label').textContent, /设置提交待确认/);
+    if (status === 'completed') await run("runSlash('/model desktop-model')");
+    run(`api = async () => ({ status: '${status}', result: {} });`);
+    await run('recoverSubmission()');
+    assert.equal(run('modelOverrides.get(threadId).model'), status === 'completed' ? 'desktop-model' : 'selected-model');
+    assert.match(get('model-label').textContent, /尚未发送/);
+    assert.equal(run('submittedModelSetting'), null);
+  }
+});
+
+test('a completed late receipt clears only its submitted model choice', async () => {
+  const { get, run } = composer(); setupModels({ run });
+  await run("runSlash('/model selected-model')");
+  run(`command = async () => {
+    submittedModelSetting.key = 'model-receipt'; delivery.begin('model-receipt', 'turn/start', threadId);
+    uncertainSubmission = true; throw Error('receipt unavailable');
+  };`);
+  get('message').value = 'fixture turn'; await assert.rejects(run('send(false)'), /receipt unavailable/);
+  run("api = async () => ({ status: 'completed', result: {} });"); await run('recoverSubmission()');
+  assert.equal(run('modelOverrides.has(threadId)'), false);
+  assert.equal(run('submittedModelSetting'), null);
 });
 
 test('new tasks remember each project component and show its path before creation', () => {

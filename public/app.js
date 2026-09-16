@@ -1,4 +1,5 @@
 import { composerMedia } from './composer-media.js';
+import { formatBytes } from './attachment-policy.js';
 import { HistoryPages } from './history-pages.js';
 import { Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary } from './timeline.js';
 import { goalPanel } from './goal-panel.js';
@@ -24,11 +25,17 @@ let stopping = false;
 let followingLatest = true;
 let scrollFrame = 0;
 let selecting = false;
+let selectingThread = '';
 let selection = 0;
 let bridgeId = null;
 let tasksLoaded = false;
 let paginatedHistory = false;
 let taskCommands = false;
+let taskArchive = false;
+let archivedView = false;
+let archiveBusy = false;
+const archiveStates = new Map();
+let archiveRevision = 0;
 let slashBusy = false;
 let creating = false;
 const historyPages = new HistoryPages(command, (id, turns) => {
@@ -47,6 +54,7 @@ let projectAssignments = {};
 const preferences = taskPreferences();
 const freshThreads = new Map();
 const mediaUrls = new Map();
+const fileAttachments = new Map();
 const modelOverrides = new Map();
 const defaultModels = new Map();
 const modelSettingVersions = new Map();
@@ -73,7 +81,9 @@ let recovering = false;
 let submittedDraft = null;
 let needsHistoryRefresh = false;
 const showError = error => { $('error').textContent = error.message ?? String(error); };
-const composerAttachments = composerMedia({ getThread: () => threadId, busy: () => sending || selecting || stopping, api, changed: updateControls, error: showError });
+const composerAttachments = composerMedia({ getThread: () => threadId, busy: () => sending || selecting || stopping, api, changed: updateControls, error: showError,
+  uploaded: (file, preview) => { fileAttachments.set(file.input.path, file); if (preview) mediaUrls.set(file.input.path, preview); },
+});
 devicePanel({ api });
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -107,7 +117,7 @@ async function api(path, data) {
     location.replace('/login');
     throw new Error('登录已过期，请重新验证密码');
   }
-  if (!response.ok) throw new Error(result.error ?? '请求失败');
+  if (!response.ok) throw Object.assign(new Error(result.error ?? '请求失败'), { submission: result.submission });
   return result;
 }
 
@@ -116,6 +126,7 @@ async function receipt(key) {
     const record = await api(`/api/commands/${encodeURIComponent(key)}`);
     if (record.status === 'completed') {
       for (const [path, url] of Object.entries(record.media ?? {})) mediaUrls.set(path, url);
+      for (const [path, file] of Object.entries(record.files ?? {})) fileAttachments.set(path, file);
       return record.result;
     }
     if (record.status !== 'pending') throw Object.assign(new Error(record.error?.message ?? '执行结果未知'), { receiptStatus: record.status });
@@ -142,12 +153,13 @@ async function command(method, params = {}, sessionName) {
   } catch (error) {
     // Keep an uncertain execution receipt across page reloads. Never replay it automatically.
     if (execution) {
-      if (error.receiptStatus === 'failed') delivery.settle(key, 'failed');
+      if (error.receiptStatus === 'failed' || error.submission === 'rejected') delivery.settle(key, 'failed');
       else try {
         const record = await api(`/api/commands/${encodeURIComponent(key)}`);
         if (record.status === 'completed') {
           delivery.settle(key, 'completed', record.result); uncertainSubmission = false;
           for (const [path, url] of Object.entries(record.media ?? {})) mediaUrls.set(path, url);
+          for (const [path, file] of Object.entries(record.files ?? {})) fileAttachments.set(path, file);
           return record.result;
         }
         delivery.settle(key, record.status);
@@ -160,7 +172,7 @@ async function command(method, params = {}, sessionName) {
 
 async function recoverSubmission() {
   const pending = delivery.pending;
-  if (!pending || recovering || sending || stopping || slashBusy || creating) return;
+  if (!pending || recovering || sending || stopping || slashBusy || creating || archiveBusy) return;
   recovering = true;
   try {
     const record = await api(`/api/commands/${encodeURIComponent(pending.key)}`);
@@ -173,6 +185,7 @@ async function recoverSubmission() {
     if (success) {
       $('error').textContent = '';
       for (const [path, url] of Object.entries(record.media ?? {})) mediaUrls.set(path, url);
+      for (const [path, file] of Object.entries(record.files ?? {})) fileAttachments.set(path, file);
       if (['turn/start', 'turn/steer'].includes(pending.method)) freshThreads.delete(id);
       if (pending.method === 'thread/start' && record.result?.thread) {
         freshThreads.set(id, record.result.thread);
@@ -195,6 +208,10 @@ async function recoverSubmission() {
           commandDialog.close();
         }
       }
+      if (['thread/archive', 'thread/unarchive'].includes(pending.method)) {
+        applyArchive(id, pending.method === 'thread/archive', record.result?.thread);
+        $('archive-dialog').close();
+      }
       if (!['turn/start', 'turn/steer', 'turn/interrupt'].includes(pending.method)) tasksLoaded = false;
       if (submittedDraft?.key === pending.key) {
         composerAttachments.clear(submittedDraft.media);
@@ -203,13 +220,16 @@ async function recoverSubmission() {
         }
         if (drafts.get(id) === submittedDraft.text) drafts.delete(id);
       }
-      if (!['thread/start', 'thread/name/set'].includes(pending.method)) needsHistoryRefresh = true;
+      if (!['thread/start', 'thread/name/set', 'thread/archive', 'thread/unarchive'].includes(pending.method)) needsHistoryRefresh = true;
     } else if (pending.method === 'thread/start') {
       $('new-error').textContent = `创建失败：${record.error?.message ?? '服务已确认失败，可以重试'}`;
     } else if (pending.method === 'thread/name/set') {
       if (pending.name && !commandDialog?.open) openCommandForm('/rename', pending.name, id, true);
       if (commandDialog?.open && commandDialog.dataset.threadId === id) $('command-error').textContent = `命名失败：${record.error?.message ?? '服务已确认失败，可以重试'}`;
       $('error').textContent = '会话名称未更新，原名称和消息草稿已保留。';
+    } else if (['thread/archive', 'thread/unarchive'].includes(pending.method)) {
+      $('archive-error').textContent = record.error?.message ?? '操作失败，会话和草稿已保留';
+      $('error').textContent = $('archive-error').textContent;
     }
     submittedDraft = null;
   } catch {
@@ -231,13 +251,17 @@ async function list(more = false) {
       } catch (error) { $('search-scope').textContent = `无法同步桌面项目：${error.message}`; }
     }
     const statusToken = pendingApprovals.token();
-    const result = await command('thread/list', { limit: 30, sortKey: 'updated_at', ...taskQuery, ...(more ? { cursor: nextCursor } : {}) });
+    const revision = archiveRevision;
+    const result = await command('thread/list', { limit: 30, sortKey: 'updated_at', ...taskQuery, archived: archivedView, ...(more ? { cursor: nextCursor } : {}) });
     if (!more) threads.clear();
     for (const thread of result.data) {
+      if (revision !== archiveRevision && archiveStates.has(thread.id) && archiveStates.get(thread.id) !== archivedView) continue;
+      archiveStates.set(thread.id, archivedView);
       threads.set(thread.id, thread);
+      if (archivedView && preferences.isFavorite(thread.id)) preferences.toggleFavorite(thread);
       pendingApprovals.thread(thread.id, thread.status, statusToken);
     }
-    for (const [id, thread] of freshThreads) if (!threads.has(id)) threads.set(id, thread);
+    for (const [id, thread] of freshThreads) if (!archivedView && !archiveStates.get(id) && !threads.has(id)) threads.set(id, thread);
     preferences.refreshFavorites(threads.values());
     nextCursor = result.nextCursor;
     $('more').hidden = !nextCursor;
@@ -279,6 +303,7 @@ function projectChoice() {
   const previous = preferences.workspace(project?.id ?? '');
   const current = threads.get(threadId)?.cwd;
   $('project-workspace').hidden = custom;
+  $('project-workspace').open = false;
   $('workspace-choice').replaceChildren(...roots.map(root => new Option(root.split('/').filter(Boolean).at(-1) || root, root)));
   $('workspace-choice').value = roots.includes(previous) ? previous : roots.includes(current) ? current : roots[0] ?? '';
   if (custom && !$('project-path').value) $('project-path').value = preferences.workspace('') ?? '';
@@ -289,7 +314,9 @@ function workspaceChoice() {
   $('workspace-path').textContent = $('workspace-choice').value;
   const project = desktopProjectList.find(project => project.id === $('project-choice').value);
   const cwd = project ? $('workspace-choice').value : $('project-path').value.trim();
-  $('new-summary').textContent = `${project?.name ?? '其他目录'} → ${cwd || '请填写工作目录'}`;
+  $('new-summary').textContent = project
+    ? `${project.name} · 包含 ${project.roots.length} 个目录，可跨目录工作`
+    : `其他目录 → ${cwd || '请填写工作目录'}`;
 }
 
 function rememberWorkspaceChoice() {
@@ -315,17 +342,22 @@ function renderTaskStates() {
     badge.textContent = `${count} 个会话待处理`;
   }
   for (const button of $('task-list').querySelectorAll('[data-rename-thread]')) {
-    const reason = commandUnavailable('/rename', button.dataset.renameThread);
+    const reason = archivedView ? '请先恢复已归档会话' : commandUnavailable('/rename', button.dataset.renameThread);
     button.disabled = !!reason;
     button.title = reason ? `不可用：${reason}` : '重命名会话';
+  }
+  for (const button of $('task-list').querySelectorAll('[data-archive-thread]')) {
+    const reason = archiveUnavailable(button.dataset.archiveThread, archivedView);
+    button.disabled = !!reason;
+    button.title = reason || (archivedView ? '恢复会话' : '归档会话');
   }
 }
 
 function renderTasks() {
   const query = $('task-search').value.trim().toLocaleLowerCase();
   const project = $('project-filter').value;
-  const known = new Map(preferences.favorites().map(task => [task.id, task]));
-  for (const task of threads.values()) known.set(task.id, task);
+  const known = new Map((archivedView ? [] : preferences.favorites().filter(task => !archiveStates.get(task.id))).map(task => [task.id, task]));
+  for (const task of threads.values()) if (!!archiveStates.get(task.id) === archivedView) known.set(task.id, task);
   const matches = [...known.values()].filter(t => matchesProject(t, project) &&
     `${t.name ?? ''} ${t.preview ?? ''} ${t.id} ${t.cwd ?? ''}`.toLocaleLowerCase().includes(query))
     .sort((a, b) => Number(preferences.isFavorite(b.id)) - Number(preferences.isFavorite(a.id)));
@@ -357,7 +389,8 @@ function renderTasks() {
     meta.textContent = `${Number.isNaN(date.getTime()) ? '' : date.toLocaleString('zh-CN') + ' · '}ID ${task.id}`;
     const state = document.createElement('span'); state.className = 'task-state'; state.dataset.taskStatus = task.id;
     button.append(title, state, path, meta);
-    button.disabled = selecting || sending || stopping || slashBusy || creating;
+    button.disabled = archivedView || selecting || sending || stopping || slashBusy || creating || archiveBusy;
+    if (archivedView) button.title = '请先点击恢复会话';
     button.onclick = async () => {
       try { await select(task.id); $('task-dialog').close(); if (pendingApprovals.get(task.id)) locateApproval(); }
       catch (error) { $('task-count').textContent = `切换失败：${error.message}`; }
@@ -371,18 +404,26 @@ function renderTasks() {
       favorite.title = saved ? '取消收藏' : '收藏任务';
     };
     updateFavorite();
+    favorite.hidden = archivedView;
     favorite.onclick = () => {
       preferences.toggleFavorite(task); updateFavorite();
       $('task-count').textContent = `显示 ${matches.length} 个任务 · 已加载 ${threads.size} · 收藏 ${preferences.favorites().length}`;
     };
     const rename = document.createElement('button'); rename.type = 'button'; rename.className = 'task-rename secondary';
-    rename.textContent = '改名'; rename.dataset.renameThread = task.id;
+    rename.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m15 4 5 5M4 20l5-1L20 8a2 2 0 0 0-5-5L4 14Z"/></svg>'; rename.dataset.renameThread = task.id;
+    rename.hidden = archivedView;
     rename.setAttribute('aria-label', `重命名：${task.name || task.preview || '未命名任务'}`);
     rename.onclick = () => {
       try { openCommandForm('/rename', undefined, task.id); }
       catch (error) { $('task-count').textContent = error.message; }
     };
-    const actions = document.createElement('div'); actions.className = 'task-actions'; actions.append(favorite, rename);
+    const archive = document.createElement('button'); archive.type = 'button'; archive.className = 'task-archive secondary'; archive.dataset.archiveThread = task.id;
+    archive.innerHTML = archivedView
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 10a8 8 0 1 1 1 8M4 4v6h6"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 8v12h16V8M9 12h6"/><rect x="3" y="3" width="18" height="5" rx="1"/></svg>';
+    archive.setAttribute('aria-label', `${archivedView ? '恢复' : '归档'}：${task.name || task.preview || '未命名任务'}`);
+    archive.onclick = () => openArchive(task, archivedView);
+    const actions = document.createElement('div'); actions.className = 'task-actions'; actions.append(favorite, rename, archive);
     row.append(button, actions);
     const owner = desktopProjectList.find(entry => matchesProject(task, entry.id));
     groups.get(owner?.id ?? 'other')?.append(row);
@@ -399,6 +440,63 @@ function renderTasks() {
     }
   }
   renderTaskStates();
+}
+
+function archiveUnavailable(id, restore = false) {
+  if (!connected) return '桌面连接尚未就绪';
+  if (!taskArchive) return '驻留桥接尚未支持归档；请在任务结束后正常重启桌面 App';
+  if (uncertainSubmission) return '请先查询上次提交结果';
+  if (archiveBusy || sending || stopping || selecting || slashBusy || creating) return '请等待当前操作完成';
+  if (!restore && (active[id] || threads.get(id)?.status?.type === 'active' || pendingApprovals.get(id))) return '任务正在运行或等待处理，请结束后再归档';
+  return '';
+}
+
+function openArchive(task, restore) {
+  const reason = archiveUnavailable(task.id, restore);
+  if (reason) { $('task-count').textContent = reason; return; }
+  const dialog = $('archive-dialog'); dialog.dataset.threadId = task.id; dialog.dataset.restore = String(restore);
+  $('archive-title').textContent = restore ? '恢复会话' : '归档会话';
+  $('archive-target').textContent = `${task.name || task.preview || '未命名任务'} · ${task.id}`;
+  $('archive-confirm').textContent = restore ? '确认恢复' : '确认归档';
+  $('archive-hint').textContent = restore ? '恢复后可在未归档列表中打开并继续发送消息。' : '归档后可在已归档列表中恢复；收藏将取消，未发送的草稿保留在当前页面。';
+  $('archive-error').textContent = ''; dialog.showModal(); updateControls();
+}
+
+function applyArchive(id, archived, restoredThread) {
+  archiveRevision++;
+  archiveStates.set(id, archived);
+  const task = restoredThread ?? threads.get(id) ?? freshThreads.get(id);
+  if (archived) {
+    freshThreads.delete(id);
+    const favorite = preferences.favorites().find(task => task.id === id);
+    if (favorite) preferences.toggleFavorite(favorite);
+    if (threadId === id) {
+      drafts.set(id, $('message').value);
+      threadId = ''; $('message').value = '';
+      sessionStorage.removeItem('codex-thread');
+      $('conversation-title').textContent = 'Codex'; $('conversation-title').title = '';
+      $('current').textContent = '会话已归档，请选择其他会话。';
+      $('history').textContent = '会话已归档，可在已归档列表中恢复。';
+      $('older-history').hidden = true; $('events').textContent = ''; log = '';
+    }
+    if (selectingThread === id || !threadId) { selection++; selecting = false; selectingThread = ''; }
+  }
+  if (archived === archivedView && task) threads.set(id, task);
+  else threads.delete(id);
+  renderTasks(); updateControls();
+}
+
+async function submitArchive() {
+  const id = $('archive-dialog').dataset.threadId, restore = $('archive-dialog').dataset.restore === 'true';
+  const reason = archiveUnavailable(id, restore);
+  if (reason) { $('archive-error').textContent = reason; return; }
+  archiveBusy = true; updateControls();
+  try {
+    const result = await command(restore ? 'thread/unarchive' : 'thread/archive', { threadId: id });
+    applyArchive(id, !restore, result?.thread);
+    $('archive-dialog').close();
+  } catch (error) { $('archive-error').textContent = `${error.message}；会话和草稿已保留，结果未知时请查询操作结果。`; }
+  finally { archiveBusy = false; updateControls(); }
 }
 
 function messageText(content) {
@@ -421,6 +519,18 @@ function appendImage(container, source, description = '任务图片') {
   const img = document.createElement('img'); img.src = url; img.alt = description; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
   img.onerror = () => { link.replaceWith(Object.assign(document.createElement('p'), { textContent: '图片已失效或暂时无法读取' })); };
   link.append(img); container.append(link);
+}
+
+function appendFile(container, attachment) {
+  const file = fileAttachments.get(attachment.path);
+  const card = document.createElement(file ? 'a' : 'div'); card.className = 'file-attachment';
+  const name = document.createElement('span'); name.textContent = file?.name ?? attachment.name ?? '文件附件'; card.append(name);
+  const detail = document.createElement('span'); detail.className = 'muted small';
+  if (file && /^\/api\/attachments\/[\da-f-]+$/i.test(file.url)) {
+    card.href = file.url; card.download = file.name;
+    detail.textContent = `${formatBytes(file.size)} · 下载原文件`;
+  } else detail.textContent = '本机文件引用 · 此文件未通过手机上传，无法下载';
+  card.append(detail); container.append(card);
 }
 
 // Build DOM nodes directly: message HTML is never executed.
@@ -552,6 +662,7 @@ function renderHistoryItem(view, key, item) {
     for (const attachment of Array.isArray(item.content) ? item.content : []) {
       if (attachment.type === 'localImage') appendImage(content, attachment.path);
       if (attachment.type === 'image') appendImage(content, attachment.url);
+      if (attachment.type === 'mention') appendFile(content, attachment);
     }
     syncChildren(block, [label, content]);
   } else {
@@ -639,12 +750,31 @@ async function loadHistory(id) {
 }
 
 async function select(id) {
+  if (archiveStates.get(id)) throw Error('会话已归档，请先在已归档列表中恢复');
+  if (archiveBusy || (uncertainSubmission && ['thread/archive', 'thread/unarchive'].includes(delivery.pending?.method))) throw Error('请先确认归档操作结果');
   if (sending || stopping || slashBusy) throw new Error('操作正在提交，请稍后切换任务');
   const request = ++selection;
   selecting = true;
+  selectingThread = id;
   updateControls();
   renderTasks();
   try {
+    // A favorite or saved selection can outlive its native active-list entry.
+    // Confirm membership before resume, which must never implicitly unarchive it.
+    if (taskArchive && !archiveStates.has(id) && !freshThreads.has(id)) {
+      let pageCursor;
+      const visited = new Set();
+      do {
+        const page = await command('thread/list', { archived: false, limit: 100, ...(pageCursor ? { cursor: pageCursor } : {}) });
+        if (request !== selection || archiveStates.get(id)) return;
+        if (page.data.some(task => task.id === id)) { archiveStates.set(id, false); break; }
+        pageCursor = page.nextCursor;
+        if (pageCursor && visited.has(pageCursor)) throw Error('会话列表分页未完成，请刷新后重试');
+        visited.add(pageCursor);
+      } while (pageCursor);
+      if (!archiveStates.has(id)) throw Error('此会话不在未归档列表中，请从已归档列表恢复后再打开');
+    }
+    if (request !== selection || archiveStates.get(id)) return;
     const statusToken = pendingApprovals.token();
     const settingsVersion = modelSettingVersions.get(id) ?? 0;
     const result = freshThreads.has(id)
@@ -657,7 +787,7 @@ async function select(id) {
       const page = await historyPages.read(id);
       result.thread.turns = page.thread.turns;
     }
-    if (request !== selection) return;
+    if (request !== selection || archiveStates.get(id)) return;
     const switched = threadId !== id;
     if (result.model && !defaultModels.has(id)) defaultModels.set(id, result.model);
     if (threadId) drafts.set(threadId, $('message').value);
@@ -679,7 +809,7 @@ async function select(id) {
     if (switched) followingLatest = true;
     scrollToLatest();
   } finally {
-    if (request === selection) { selecting = false; updateControls(); renderTasks(); }
+    if (request === selection) { selecting = false; selectingThread = ''; updateControls(); renderTasks(); }
   }
 }
 
@@ -715,6 +845,8 @@ function updateControls() {
   if (waiting && !uncertainSubmission && !sending && !stopping) $('delivery-status').textContent = '';
   $('recovery-actions').hidden = !uncertainSubmission;
   $('reconcile').hidden = !uncertainSubmission;
+  $('reconcile').textContent = ['thread/archive', 'thread/unarchive'].includes(delivery.pending?.method)
+    ? '已核对归档状态，清除未知操作记录' : '已核对历史，清除未知提交记录';
   $('reconcile').disabled = sending || stopping || recovering || slashBusy;
   $('check-receipt').disabled = !connected || recovering || sending || stopping;
   $('choose-task').disabled = $('workspace').hidden;
@@ -725,6 +857,13 @@ function updateControls() {
   renderTaskStates();
   renderApprovalReminders();
   updateCommandAvailability();
+  if (archiveBusy) for (const id of ['send', 'new', 'create', 'quick-toggle']) $(id).disabled = true;
+  $('archive-filter').disabled = listing || archiveBusy || !taskArchive;
+  $('archive-support').textContent = taskArchive ? '' : '当前驻留桥接尚未支持归档；请在任务结束后正常重启桌面 App。';
+  $('archive-confirm').disabled = !!archiveUnavailable($('archive-dialog').dataset.threadId, $('archive-dialog').dataset.restore === 'true');
+  $('archive-cancel').disabled = archiveBusy;
+  $('archive-receipt').hidden = !uncertainSubmission;
+  $('archive-receipt').disabled = !connected || recovering || archiveBusy;
   if ($('status-dialog').open) renderStatus();
 }
 
@@ -763,6 +902,8 @@ window.visualViewport?.addEventListener('scroll', syncKeyboard);
 window.addEventListener('resize', syncKeyboard);
 
 function commandUnavailable(name, targetId = threadId) {
+  if (archiveBusy) return '请等待归档操作完成';
+  if (targetId && archiveStates.get(targetId)) return '请先恢复已归档会话';
   if (slashBusy || sending || stopping || selecting || creating) return '请等待当前操作完成';
   if (['/new', '/resume', '/rename', '/compact', '/goal', '/stop'].includes(name) && !connected) return '桌面连接尚未就绪';
   if (['/rename', '/compact', '/goal'].includes(name) && !taskCommands) return '驻留桥接尚未支持此命令；请在任务结束后重启桌面 App';
@@ -1320,13 +1461,24 @@ async function poll() {
     connected = state.ready;
     paginatedHistory = !!state.capabilities?.paginatedHistory;
     taskCommands = !!state.capabilities?.taskCommands;
+    taskArchive = !!state.capabilities?.taskArchive;
     $('status').textContent = state.ready ? '已连接' : '等待 App Server';
     $('mode').textContent = state.mode === 'desktop-shared' ? '桌面共享连接 · 手机关闭后任务继续运行' : state.mode === 'standalone' ? '独立服务 · 此连接不控制桌面任务' : 'Web 已连接，等待桌面桥接；无需重启 Web。';
     const changed = bridgeId && state.bridgeId && state.bridgeId !== bridgeId;
     if (state.bridgeId) bridgeId = state.bridgeId;
-    if (!connected || changed) tasksLoaded = false;
+    if (!connected || changed || (state.reset && state.cursor !== cursor)) {
+      tasksLoaded = false; archiveRevision++;
+      // Missed events invalidate active membership, never infer an archived task is active.
+      for (const [id, archived] of archiveStates) if (!archived) archiveStates.delete(id);
+    }
     active = state.active ?? {};
     pendingApprovals.snapshot(state, changed);
+    for (const event of state.events ?? []) {
+      if (['thread/archived', 'thread/unarchived'].includes(event.method) && event.params?.threadId) {
+        applyArchive(event.params.threadId, event.method === 'thread/archived');
+        tasksLoaded = false;
+      }
+    }
     if (changed) { approvalCards.clear(); approvalSignature = ''; }
     renderApprovals();
     updateControls();
@@ -1344,7 +1496,7 @@ async function poll() {
         $('command-hint').textContent = '此会话已创建。保存名称即可继续，不会重复创建会话。';
       }
     }
-    const hydrating = connected && !tasksLoaded && !sending && !stopping && !selecting;
+    const hydrating = connected && !tasksLoaded && !sending && !stopping && !selecting && !archiveBusy;
     if (hydrating) {
       await list();
       tasksLoaded = true;
@@ -1353,6 +1505,14 @@ async function poll() {
         try { await select(previous); }
         catch (error) {
           // Keep the draft and healthy connection; let the user choose or create a task.
+          if (taskArchive && threadId === previous && !archiveStates.has(previous)) {
+            drafts.set(previous, $('message').value); threadId = ''; $('message').value = '';
+            selection++; selecting = false; selectingThread = '';
+            sessionStorage.removeItem('codex-thread');
+            $('conversation-title').textContent = 'Codex'; $('conversation-title').title = '';
+            $('current').textContent = '请选择会话'; $('history').textContent = '请重新选择会话，草稿已保留。';
+            $('older-history').hidden = true;
+          }
           showError(new Error(`无法恢复上次会话，请在会话列表中重新选择：${error.message}`));
         }
       }
@@ -1363,6 +1523,7 @@ async function poll() {
     for (const event of state.events) {
       goals.event(event);
       if (event.method === 'thread/name/updated' && event.params?.threadId) applyTaskName(event.params.threadId, event.params.threadName ?? '', false);
+      if (event.method === 'thread/status/changed' && threads.has(event.params?.threadId)) threads.get(event.params.threadId).status = event.params.status;
       if (event.method === 'thread/settings/updated' && event.params?.threadId) {
         const id = event.params.threadId, settings = event.params.threadSettings;
         if (settings) {
@@ -1387,7 +1548,7 @@ async function poll() {
         refreshHistory = true;
       }
     }
-    if (refreshHistory) {
+    if (refreshHistory && !archiveStates.get(currentThread) && selected === selection) {
       try {
         const result = await loadHistory(currentThread);
         // A read belongs to the selection that initiated it, even if the same task is reopened.
@@ -1408,6 +1569,8 @@ async function poll() {
   } catch (error) {
     if (!stateReceived) {
       connected = false;
+      archiveRevision++;
+      for (const [id, archived] of archiveStates) if (!archived) archiveStates.delete(id);
       pendingApprovals.disconnect();
       renderApprovals();
       tasksLoaded = false;
@@ -1470,6 +1633,18 @@ $('jump-approvals').onclick = locateApproval;
 $('open-current-approval').onclick = locateApproval;
 $('close-tasks').onclick = () => $('task-dialog').close();
 $('task-search').oninput = renderTasks;
+$('archive-confirm').onclick = submitArchive;
+$('archive-cancel').onclick = () => $('archive-dialog').close();
+$('archive-receipt').onclick = () => recoverSubmission().catch(showError);
+$('archive-dialog').oncancel = event => { if (archiveBusy) event.preventDefault(); };
+$('archive-filter').onchange = async () => {
+  if (listing) return;
+  if (!taskArchive) { $('archive-filter').value = archivedView ? 'archived' : 'active'; return; }
+  const previous = archivedView;
+  archivedView = $('archive-filter').value === 'archived';
+  try { await list(); }
+  catch (error) { archivedView = previous; $('archive-filter').value = previous ? 'archived' : 'active'; showError(error); }
+};
 $('search-all').onclick = async () => {
   if (listing) return;
   const searchTerm = $('task-search').value.trim();
@@ -1477,7 +1652,7 @@ $('search-all').onclick = async () => {
   const cwd = selectedProject?.roots;
   const previous = taskQuery;
   taskQuery = { ...(searchTerm ? { searchTerm } : {}), ...(cwd ? { cwd } : {}) };
-  $('search-scope').textContent = '正在搜索未归档任务标题…';
+  $('search-scope').textContent = `正在搜索${archivedView ? '已归档' : '未归档'}任务标题…`;
   try {
     await list();
     $('search-scope').textContent = `历史标题搜索${searchTerm ? '：' + searchTerm : ''}；按最近更新时间排序${selectedProject ? '，限定项目 ' + selectedProject.name : ''}。可加载更多结果。`;
@@ -1490,7 +1665,7 @@ $('recent-tasks').onclick = async () => {
   try {
     await list();
     $('task-search').value = ''; $('project-filter').value = ''; renderTasks();
-    $('search-scope').textContent = '最近更新的未归档任务；输入可筛选已加载任务，或搜索历史标题。';
+    $('search-scope').textContent = `最近更新的${archivedView ? '已归档' : '未归档'}任务；输入可筛选已加载任务，或搜索历史标题。`;
   } catch (error) { taskQuery = previous; $('search-scope').textContent = `加载失败：${error.message}`; }
 };
 $('project-filter').onchange = renderTasks;
@@ -1540,9 +1715,9 @@ $('new-form').onsubmit = async event => {
     if (!connected) throw Error('桌面连接尚未就绪');
     if (name) requireTaskCommands();
     if (project && !project.serverId) throw Error('该项目尚未同步到桌面服务，请先在桌面打开此项目后刷新任务。');
-    if (project && !project.roots.includes(cwd)) throw Error('请选择该项目中的工作目录。');
+    if (project && !project.roots.includes(cwd)) throw Error('项目起始目录已失效，请刷新项目后重试。');
     if (!cwd) throw Error('请填写工作目录。');
-    const result = await command('thread/start', { cwd, ...(project ? { projectId: project.serverId, runtimeWorkspaceRoots: [cwd] } : {}) }, name);
+    const result = await command('thread/start', { cwd, ...(project ? { projectId: project.serverId, runtimeWorkspaceRoots: [...project.roots] } : {}) }, name);
     created = result.thread;
     preferences.rememberWorkspace(project?.id ?? '', cwd);
     if (project) projectAssignments[result.thread.id] = project.id;
@@ -1575,7 +1750,11 @@ $('logout').onclick = async () => {
 };
 $('reconcile').onclick = () => {
   if (sending || stopping || recovering || slashBusy) return;
-  if (!confirm('请先刷新并检查任务历史。清除记录不会取消已提交的指令；确定已核对执行状态？')) return;
+  const archiveOperation = ['thread/archive', 'thread/unarchive'].includes(delivery.pending?.method);
+  const message = archiveOperation
+    ? '请先在桌面或刷新已归档/未归档列表，核对目标会话的归档状态。清除记录不会重发、撤销或取消已提交的归档操作；确定已完成核对？'
+    : '请先刷新并检查任务历史。清除记录不会取消已提交的指令；确定已核对执行状态？';
+  if (!confirm(message)) return;
   delivery.clear();
   submittedDraft = null;
   uncertainSubmission = false;
@@ -1585,14 +1764,15 @@ $('reconcile').onclick = () => {
 };
 $('check-receipt').onclick = () => recoverSubmission().then(poll).catch(showError);
 async function send(steer, quickText) {
+  if (archiveBusy || archiveStates.get(threadId)) throw Error('请先确认会话归档状态或恢复会话');
   if (sending || selecting || stopping || slashBusy || creating || composingText || composerAttachments.reading()) return;
   const text = quickText ?? $('message').value;
   if (text.trim().startsWith('/')) {
-    if (composerAttachments.hasImages()) throw Error('图片不能随 / 命令发送，请输入普通消息。');
+    if (composerAttachments.hasImages()) throw Error('附件不能随 / 命令发送，请输入普通消息。');
     return runSlash(text);
   }
   if (uncertainSubmission) throw Error('上次提交结果待确认，请先查询发送结果');
-  if (!connected || !threadId || (!text.trim() && !composerAttachments.hasImages())) throw new Error('请选择任务并输入指令或添加图片');
+  if (!connected || !threadId || (!text.trim() && !composerAttachments.hasImages())) throw new Error('请选择任务并输入指令或添加附件');
   sending = true;
   submittedModelSetting = !steer && modelOverrides.has(threadId) ? { id: threadId, setting: modelOverrides.get(threadId) } : null;
   submittedDraft = quickText === undefined ? { threadId, text, media: composerAttachments.capture() } : null;
@@ -1615,7 +1795,7 @@ async function send(steer, quickText) {
     scrollToLatest();
     $('error').textContent = '';
   } catch (error) {
-    deliveryOutcomes.set(threadId, uncertainSubmission ? '结果待确认' : '发送失败，文字和图片已保留');
+    deliveryOutcomes.set(threadId, uncertainSubmission ? '结果待确认' : '发送失败，文字和附件已保留');
     if (!uncertainSubmission) { submittedDraft = null; finishModelSubmission(false); }
     throw error;
   } finally { sending = false; updateControls(); }

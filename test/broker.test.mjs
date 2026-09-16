@@ -9,6 +9,57 @@ function fixture() {
   return { broker, upstream, desktop };
 }
 
+test('native archive and restore are deduplicated, preserve failed receipts and enforce ownership', async () => {
+  const { broker, upstream } = fixture();
+  assert.equal(broker.snapshot().capabilities.taskArchive, true);
+  const receipt = broker.submit('archive-001', 'thread/archive', { threadId: 'task' });
+  assert.equal(broker.submit('archive-001', 'thread/archive', { threadId: 'task' }), receipt);
+  assert.equal(upstream.length, 1);
+  broker.receive({ method: 'thread/archived', params: { threadId: 'task' } });
+  broker.receive({ id: upstream[0].id, result: {} });
+  assert.equal(receipt.status, 'completed');
+  assert.throws(() => broker.submit('resume-001', 'thread/resume', { threadId: 'task' }), /已归档/);
+  const restore = broker.submit('restore-001', 'thread/unarchive', { threadId: 'task' });
+  broker.receive({ id: upstream[1].id, error: { code: -1, message: 'restore rejected' } });
+  await Promise.resolve();
+  assert.equal(restore.status, 'failed');
+  assert.equal(broker.getCommand('restore-001'), restore);
+  broker.submit('restore-002', 'thread/unarchive', { threadId: 'task' });
+  broker.receive({ id: upstream[2].id, result: { thread: { id: 'task' } } });
+  assert.doesNotThrow(() => broker.submit('resume-002', 'thread/resume', { threadId: 'task' }));
+  const privateBroker = new Broker(() => {}, () => {}, { ownedThreads: new Set(['owned']) }); privateBroker.ready = true;
+  for (const method of ['thread/archive', 'thread/unarchive']) assert.throws(() => privateBroker.submit('private-001', method, { threadId: 'foreign' }), /独立模式/);
+});
+
+test('archive blocks observed runs, pending starts and native desktop waits before upstream submission', () => {
+  const { broker, upstream } = fixture();
+  broker.receive({ method: 'turn/started', params: { threadId: 'running', turn: { id: 'turn' } } });
+  broker.submit('start-001', 'turn/start', { threadId: 'starting' });
+  broker.receive({ method: 'thread/status/changed', params: { threadId: 'waiting', status: { type: 'active', activeFlags: ['waitingOnApproval'] } } });
+  broker.receive({ id: 'approval', method: 'item/tool/requestUserInput', params: { threadId: 'approval' } });
+  for (const id of ['running', 'starting', 'waiting', 'approval']) {
+    const receipt = broker.submit(`archive-${id}`, 'thread/archive', { threadId: id });
+    assert.equal(receipt.status, 'failed');
+    assert.match(receipt.error.message, /运行或等待/);
+    assert.equal(broker.getCommand(`archive-${id}`), receipt);
+  }
+  assert.equal(upstream.length, 1);
+});
+
+test('desktop archive responses identify their task and stale lists cannot erase a newer native wait', () => {
+  const { broker, upstream } = fixture();
+  broker.fromDesktop({ id: 1, method: 'thread/archive', params: { threadId: 'desktop-task' } });
+  broker.receive({ id: upstream[0].id, result: {} });
+  assert.equal(broker.archived.has('desktop-task'), true);
+  assert.equal(broker.archived.has(undefined), false);
+  broker.submit('list-0001', 'thread/list', {});
+  broker.receive({ method: 'thread/status/changed', params: { threadId: 'waiting', status: { type: 'active', activeFlags: ['waitingOnApproval'] } } });
+  broker.receive({ id: upstream[1].id, result: { data: [{ id: 'waiting', status: { type: 'idle' } }] } });
+  assert.equal(broker.submit('archive-wait', 'thread/archive', { threadId: 'waiting' }).status, 'failed');
+  broker.submit('archive-idle', 'thread/archive', { threadId: 'idle' });
+  assert.throws(() => broker.submit('turn-idle', 'turn/start', { threadId: 'idle' }), /正在归档/);
+});
+
 test('goal and task commands share upstream, receipts and standalone ownership checks', () => {
   const { broker, upstream } = fixture();
   assert.equal(broker.snapshot().capabilities.taskCommands, true);

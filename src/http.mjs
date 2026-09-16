@@ -6,6 +6,7 @@ import { taskImages } from './images.mjs';
 import { desktopProjects } from './projects.mjs';
 import { desktopModels } from './models.mjs';
 import { saveUpload } from './uploads.mjs';
+import { attachmentStore } from './attachments.mjs';
 import { serviceConfig } from './service-config.mjs';
 import { join } from 'node:path';
 import { loginSource } from './login-source.mjs';
@@ -17,6 +18,7 @@ const assets = new Map([
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/approval-state.js', ['approval-state.js', 'text/javascript; charset=utf-8']],
   ['/composer-media.js', ['composer-media.js', 'text/javascript; charset=utf-8']],
+  ['/attachment-policy.js', ['attachment-policy.js', 'text/javascript; charset=utf-8']],
   ['/history-pages.js', ['history-pages.js', 'text/javascript; charset=utf-8']],
   ['/timeline.js', ['timeline.js', 'text/javascript; charset=utf-8']],
   ['/goal-panel.js', ['goal-panel.js', 'text/javascript; charset=utf-8']],
@@ -47,6 +49,7 @@ export function createWebServer(broker, { password, origin, mode, now, allowLanH
   const source = loginSource(trustedProxyAddresses);
   const allowedOrigins = new Set([origin, ...additionalOrigins]);
   const images = taskImages();
+  const attachments = attachmentStore(uploadDirectory);
   return http.createServer(async (req, res) => {
     let action, audited = false;
     const record = (result, session = auth.session(req), targetId = null) => {
@@ -123,21 +126,36 @@ export function createWebServer(broker, { password, origin, mode, now, allowLanH
         res.setHeader('Content-Type', image.type);
         res.end(image.data); return;
       }
+      if (req.method === 'GET' && url.pathname.startsWith('/api/attachments/')) {
+        const file = await attachments.download(url.pathname.slice('/api/attachments/'.length));
+        if (!file) return json(404, { error: '未找到已登记附件' });
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="attachment.${file.extension}"; filename*=UTF-8''${encodeURIComponent(file.name).replace(/['()*]/g, char => `%${char.charCodeAt(0).toString(16)}`)}`);
+        res.end(file.data); return;
+      }
       if (req.method === 'GET' && url.pathname.startsWith('/api/commands/')) {
         const command = await broker.getCommand(url.pathname.slice('/api/commands/'.length));
-        return json(command ? 200 : 404, command ? { ...command, media: images.register(command.result) } : { error: '没有此提交记录；请核对任务历史，勿盲目重发' });
+        return json(command ? 200 : 404, command ? { ...command, media: images.register(command.result), files: await attachments.register(command.result) } : { error: '没有此提交记录；请核对任务历史，勿盲目重发' });
       }
       if (req.method === 'POST') {
+        if (url.pathname === '/api/attachments') {
+          if (req.headers['content-type'] !== 'application/octet-stream') return json(415, { error: '需要二进制文件' });
+          return json(201, await attachments.upload(req, auth.session(req).id, url.searchParams.get('batch'), url.searchParams.get('id'), decodeURIComponent(req.headers['x-attachment-name'] ?? ''), () => auth.authenticated(req)));
+        }
         if (!req.headers['content-type']?.startsWith('application/json')) { record('failed'); return json(415, { error: '需要 JSON' }); }
         if (url.pathname === '/api/uploads') {
           const data = await body(req, 12 * 1024 * 1024);
           if (!auth.authenticated(req)) return json(401, { error: '请先验证访问密码' });
-          return json(201, await saveUpload(uploadDirectory, data.image));
+          return json(201, await attachments.registerLegacy(await saveUpload(uploadDirectory, data.image)));
         }
         const data = await body(req);
         // Revocation/expiry can occur while the request body is still arriving.
         if (!auth.authenticated(req)) { record('denied'); return json(401, { error: '请先验证访问密码' }); }
         if (url.pathname === '/api/commands' && readOnlyRpc.has(data?.method)) action = undefined;
+        if (url.pathname === '/api/attachment-batches') {
+          attachments.retain(auth.session(req).id, data.batch, data.keep);
+          return json(200, { ok: true });
+        }
         if (url.pathname === '/api/sessions/list') return json(200, { sessions: auth.list(req) });
         if (url.pathname === '/api/security-audit/list') return json(200, audit.list());
         if (url.pathname === '/api/sessions/revoke') {
@@ -156,6 +174,10 @@ export function createWebServer(broker, { password, origin, mode, now, allowLanH
         }
         if (url.pathname === '/api/commands') {
           const session = auth.session(req);
+          if (['turn/start', 'turn/steer'].includes(data.method)) {
+            try { await attachments.validateInput(data.params?.input); }
+            catch (error) { record('failed'); return json(400, { error: error.message, submission: 'rejected' }); }
+          }
           const command = await broker.submit(data.key, data.method, data.params);
           record(command.status === 'failed' ? 'failed' : command.status === 'completed' ? 'success' : 'accepted', session);
           return json(202, command);

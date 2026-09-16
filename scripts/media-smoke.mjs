@@ -6,6 +6,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
   await page.route('http://localhost:9789/**', async route => {
     const path = new URL(route.request().url()).pathname;
+    if (path === '/api/attachments') { await route.fulfill({ json: { input: { type: 'localImage', path: '/private/upload.png' } } }); return; }
     const name = path === '/' ? 'index.html' : path.slice(1);
     const body = name === 'app.js' ? '' : await readFile(new URL('../public/' + name, import.meta.url));
     await route.fulfill({ body, contentType: name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html' });
@@ -36,8 +37,8 @@ try {
   await page.evaluate(() => { window.currentTask = 'one'; window.media.render(); });
   assert.deepEqual(await page.evaluate(() => window.media.input()), [{ type: 'localImage', path: '/private/upload.png' }]);
   await page.evaluate(() => window.media.input());
-  assert.equal(await page.evaluate(() => window.uploads.length), 1, 'reuse upload after a failed message send');
-  await page.getByRole('button', { name: '移除图片 截图.png' }).click();
+  assert.equal(await page.evaluate(() => window.uploads.filter(call => call.path === '/api/attachment-batches').length), 2, 'reconcile the same draft before retry');
+  await page.getByRole('button', { name: '移除附件 截图.png' }).click();
   assert.equal(await page.locator('#image-previews img').count(), 0);
   await page.evaluate(() => {
     const transfer = new DataTransfer(); transfer.items.add(new File([new Uint8Array([137,80,78,71])], 'paste.png', { type: 'image/png' }));

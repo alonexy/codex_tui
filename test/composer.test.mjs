@@ -7,6 +7,7 @@ import { Timeline, turnItems, isProcessItem, processAction, operationFailed, pro
 import { DeliveryState, deliveryLabel } from '../public/delivery-state.js';
 import { taskPreferences } from '../public/task-preferences.js';
 import { ApprovalState, approvalLabel, isAnswerable } from '../public/approval-state.js';
+import { formatBytes } from '../public/attachment-policy.js';
 
 function composer(storage = { getItem() { return null; }, setItem() {} }, session = { removeItem() {}, getItem() { return null; }, setItem() {} }) {
   const elements = new Map();
@@ -60,6 +61,7 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary,
     DeliveryState, deliveryLabel, devicePanel: () => {},
     ApprovalState, approvalLabel, isAnswerable,
+    formatBytes,
     taskPreferences: () => taskPreferences(storage),
     goalPanel: () => ({ open: async () => {}, event() {} }),
   });
@@ -69,6 +71,106 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
   run("connected = true; threadId = 'thread-1';");
   return { get, run };
 }
+
+test('an explicitly rejected attachment submission clears uncertainty without polling or replay', async () => {
+  const { run } = composer();
+  run(`globalThis.crypto = { getRandomValues: bytes => bytes };
+    globalThis.calls = []; api = async (path, body) => { calls.push({ path, body }); throw Object.assign(Error('attachment rejected'), { submission: 'rejected' }); };`);
+  await assert.rejects(run(`command('turn/start', { threadId, input: [{ type: 'mention', name: 'a.txt', path: '/unregistered/a.txt' }] })`), /attachment rejected/);
+  assert.equal(run('uncertainSubmission'), false);
+  assert.equal(run('delivery.pending'), null);
+  assert.equal(run('calls.length'), 1);
+});
+
+test('archive confirmation, failure, notification and restored selection preserve drafts and favorites', async () => {
+  const { get, run } = composer();
+  run(`taskArchive = true; threads.set(threadId, { id: threadId, name: '当前' }); preferences.toggleFavorite(threads.get(threadId));
+    globalThis.calls = []; command = async (method, params) => { calls.push({ method, params }); throw Error('archive rejected'); };
+    openArchive(threads.get(threadId), false);`);
+  get('message').value = '保留草稿';
+  get('archive-cancel').onclick();
+  assert.equal(run('calls.length'), 0);
+  run('openArchive(threads.get(threadId), false)');
+  await get('archive-confirm').onclick();
+  assert.equal(run('threadId'), 'thread-1');
+  assert.equal(run("preferences.isFavorite('thread-1')"), true);
+  assert.equal(get('message').value, '保留草稿');
+  run(`command = async () => { applyArchive('thread-1', true); return {}; }`);
+  await get('archive-confirm').onclick();
+  assert.equal(run('threadId'), '');
+  assert.equal(run("drafts.get('thread-1')"), '保留草稿');
+  assert.equal(run("preferences.isFavorite('thread-1')"), false);
+  await assert.rejects(run("select('thread-1')"), /已归档/);
+  run(`applyArchive('thread-1', false, { id: 'thread-1', name: '当前' }); command = async () => ({ thread: { id: 'thread-1', turns: [] } });`);
+  await run("select('thread-1')");
+  assert.equal(get('message').value, '保留草稿');
+});
+
+test('unknown archive receipts recover without replay and archived lists exclude active favorites', async () => {
+  const { get, run } = composer();
+  run(`taskArchive = true; threads.set('thread-1', { id: 'thread-1', name: '当前' });
+    delivery.begin('archive-key', 'thread/archive', 'thread-1'); uncertainSubmission = true;
+    globalThis.calls = []; api = async path => { calls.push(path); return { status: 'completed', result: {} }; };
+    command = async () => { throw Error('must not replay'); };`);
+  get('message').value = '未知时保留';
+  await run('recoverSubmission()');
+  assert.equal(run('calls.length'), 1);
+  assert.equal(run('delivery.pending'), null);
+  assert.equal(run('threadId'), '');
+  assert.equal(run("drafts.get('thread-1')"), '未知时保留');
+  run(`preferences.toggleFavorite({ id: 'favorite', name: '收藏' }); archivedView = true;
+    command = async (method, params) => { calls.push(params); return { data: [{ id: 'archived', name: '归档' }], nextCursor: 'page-2' }; };
+    api = async () => ({ projects: [], assignments: {} });`);
+  await run('list()');
+  assert.equal(run('calls.at(-1).archived'), true);
+  assert.equal(get('task-list').querySelectorAll('.task-card').length, 1);
+  assert.equal(get('task-list').querySelectorAll('.task-card')[0].disabled, true);
+  await run('list(true)');
+  assert.equal(run('calls.at(-1).cursor'), 'page-2');
+});
+
+test('archive notification invalidates an in-flight selection and old bridges explain disabled controls', async () => {
+  const { get, run } = composer();
+  run(`taskArchive = true; archiveStates.set('other', false); command = async () => new Promise(resolve => globalThis.resolveSelection = resolve);`);
+  const selection = run("select('other')");
+  run(`applyArchive('other', true); resolveSelection({ thread: { id: 'other', turns: [] } });`);
+  await selection;
+  assert.equal(run('threadId'), 'thread-1');
+  run(`taskArchive = false; threads.set('active-other', { id: 'active-other' }); renderTasks(); updateControls();`);
+  assert.equal(get('task-list').querySelectorAll('[data-archive-thread]')[0].disabled, true);
+  assert.match(get('archive-support').textContent, /重启/);
+});
+
+test('a reconnect rechecks cached active selection and never resumes a now archived saved task', async () => {
+  const session = { getItem: key => key === 'codex-thread' ? 'old-task' : null, setItem() {}, removeItem() {} };
+  const { run } = composer(undefined, session);
+  run(`threadId = 'old-task'; taskArchive = true; archiveStates.set('old-task', false); tasksLoaded = true; bridgeId = 'old';
+    globalThis.calls = []; api = async path => path.startsWith('/api/state')
+      ? { ready: true, bridgeId: 'new', capabilities: { taskArchive: true }, active: {}, approvals: [], cursor: 10, reset: true, events: [] }
+      : { projects: [], assignments: {} };
+    command = async (method, params) => { calls.push({ method, params }); if (method !== 'thread/list') throw Error('must not resume archived task'); return { data: [], nextCursor: null }; };`);
+  await run('poll()');
+  assert.equal(run("calls.every(call => call.method === 'thread/list')"), true);
+  assert.equal(run("archiveStates.has('old-task')"), false);
+  assert.equal(run('threadId'), '');
+});
+
+test('a lost archive receipt can be manually cleared only after explicit status confirmation without replay', () => {
+  const { get, run } = composer();
+  run(`delivery.begin('archive-lost', 'thread/archive', 'thread-1'); uncertainSubmission = true;
+    globalThis.calls = []; command = async (...args) => calls.push(args);
+    globalThis.confirm = message => { globalThis.prompt = message; return false; }; updateControls();`);
+  get('message').value = '保留草稿';
+  assert.match(get('reconcile').textContent, /归档状态/);
+  get('reconcile').onclick();
+  assert.equal(run('uncertainSubmission'), true);
+  assert.match(run('prompt'), /桌面或刷新已归档/);
+  run('confirm = () => true');
+  get('reconcile').onclick();
+  assert.equal(run('delivery.pending'), null);
+  assert.equal(run('calls.length'), 0);
+  assert.equal(get('message').value, '保留草稿');
+});
 
 test('each turn retains one disclosure through completion, refresh and thread switches', () => {
   const { get, run } = composer();
@@ -705,7 +807,7 @@ test('a completed late receipt clears only its submitted model choice', async ()
   assert.equal(run('submittedModelSetting'), null);
 });
 
-test('new tasks remember each project component and show its path before creation', () => {
+test('new tasks select a project and keep remembered starting directories optional', () => {
   const local = new Map();
   const storage = { getItem: key => local.get(key), setItem: (key, value) => local.set(key, value) };
   const setup = app => app.run("desktopProjectList = [{ id: 'a', name: '项目 A', roots: ['/a/web', '/a/api'] }, { id: 'b', name: '项目 B', roots: ['/b'] }];");
@@ -718,9 +820,37 @@ test('new tasks remember each project component and show its path before creatio
   const restored = composer(storage); setup(restored); restored.get('new').onclick();
   assert.equal(restored.get('project-choice').value, 'a');
   assert.equal(restored.get('workspace-choice').value, '/a/api');
-  assert.equal(restored.get('new-summary').textContent, '项目 A → /a/api');
+  assert.equal(restored.get('new-summary').textContent, '项目 A · 包含 2 个目录，可跨目录工作');
+  assert.equal(restored.get('project-workspace').open, false);
   restored.run("desktopProjectList[0].roots = ['/a/replacement']; projectChoice()");
   assert.equal(restored.get('workspace-choice').value, '/a/replacement', 'removed roots must not stay selected');
+});
+
+test('project creation includes all roots even when the optional starting directory changes', async () => {
+  const { get, run } = composer();
+  run(`desktopProjectList = [{ id: 'project', serverId: 'native-project', name: '组合项目', roots: ['/repo/frontend', '/services/backend'] }];
+    globalThis.calls = []; command = async (method, params) => {
+      calls.push({ method, params });
+      return { thread: { id: 'new-' + calls.length, cwd: params.cwd, projectId: params.projectId, turns: [] } };
+    };`);
+  get('new').onclick();
+  assert.equal(get('project-workspace').open, false);
+  await get('new-form').onsubmit({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(run('JSON.stringify(calls[0])')), {
+    method: 'thread/start', params: { cwd: '/repo/frontend', projectId: 'native-project', runtimeWorkspaceRoots: ['/repo/frontend', '/services/backend'] },
+  });
+  get('new').onclick();
+  get('workspace-choice').value = '/services/backend';
+  get('workspace-choice').onchange();
+  await get('new-form').onsubmit({ preventDefault() {} });
+  assert.deepEqual(JSON.parse(run('JSON.stringify(calls[1].params)')), {
+    cwd: '/services/backend', projectId: 'native-project', runtimeWorkspaceRoots: ['/repo/frontend', '/services/backend'],
+  });
+  get('new').onclick();
+  get('workspace-choice').value = '/outside';
+  await get('new-form').onsubmit({ preventDefault() {} });
+  assert.equal(run('calls.length'), 2);
+  assert.match(get('new-error').textContent, /起始目录已失效/);
 });
 
 test('saved tasks remain reachable outside recent results with accessible favorites and live states', () => {

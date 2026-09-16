@@ -130,6 +130,11 @@ main { max-width: 800px; padding-top: 4px; }
 .upload-preview { position: relative; flex: 0 0 72px; }
 .upload-preview img { width: 72px; height: 72px; object-fit: cover; border-radius: 10px; }
 .upload-preview button { position: absolute; right: 0; top: 0; width: 28px; height: 28px; min-height: 28px; padding: 0; border-radius: 50%; }
+.upload-preview.file-preview { flex-basis: 180px; min-width: 0; padding: 10px 30px 10px 10px; border: 1px solid var(--border, #ccc); border-radius: 10px; }
+.upload-details { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 12px; }
+.upload-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-state { color: var(--muted, #777); font-size: 11px; }
+.file-attachment { display: flex; flex-direction: column; gap: 4px; padding: 12px; margin-block: 8px; border: 1px solid var(--border, #ccc); border-radius: 10px; overflow-wrap: anywhere; }
 #media-status:empty { display: none; }
 .composer-tools button { display: grid; place-items: center; width: var(--control-size); height: var(--control-size); min-height: var(--control-size); border-radius: 50%; padding: 0; flex: 0 0 var(--control-size); font-size: 24px; line-height: 1; }
 #attach-image, #voice-input, #slash-toggle { border: 0; background: transparent; color: var(--text); }
@@ -173,12 +178,13 @@ main { max-width: 800px; padding-top: 4px; }
 .composer-box #message:focus-visible { outline: none; }
 #delivery-status:empty { display: none; }
 #status-details { overflow-wrap: anywhere; }
-.task-row { display: flex; align-items: center; gap: 6px; margin: 6px 0 6px 8px; }
+.task-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0; margin: 6px 0 6px 8px; }
 .task-row .task-card { flex: 1; min-width: 0; margin: 0; padding: 10px; }
 .task-favorite { flex: 0 0 44px; width: 44px; height: 44px; padding: 0; background: transparent; color: var(--muted); }
 .task-favorite[aria-pressed="true"] { color: #f5d678; border-color: #807048; }
-.task-actions { flex: 0 0 44px; display: flex; flex-direction: column; gap: 4px; }
-.task-rename { width: 44px; min-height: 44px; padding: 0; font-size: .75rem; }
+.task-actions { flex: 0 0 100%; display: flex; justify-content: flex-end; gap: 4px; }
+.task-rename, .task-archive { width: 44px; min-height: 44px; padding: 0; display: grid; place-items: center; }
+.task-actions svg { width: 17px; height: 17px; }
 .task-state { font-size: .75rem; }
 .task-state[data-state="running"] { color: #a9dfb2; }
 .command-group { margin: 4px 0 10px; }

@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 const allowed = new Set(['thread/list', 'thread/read', 'thread/start', 'thread/resume',
   'thread/turns/list', 'thread/items/list',
   'thread/goal/get', 'thread/goal/set', 'thread/goal/clear',
-  'thread/name/set', 'thread/compact/start',
+  'thread/name/set', 'thread/compact/start', 'thread/archive', 'thread/unarchive',
   'turn/start', 'turn/steer', 'turn/interrupt']);
 export const approvalMethods = new Set(['item/commandExecution/requestApproval',
   'item/fileChange/requestApproval', 'item/tool/requestUserInput']);
@@ -20,6 +20,10 @@ export class Broker extends EventEmitter {
     this.approvals = new Map();
     this.active = new Map();
     this.starting = new Set();
+    this.threadStatus = new Map();
+    this.statusCursors = new Map();
+    this.archived = new Set();
+    this.archiving = new Set();
     this.events = [];
     this.cursor = 0;
     this.ready = false;
@@ -37,7 +41,7 @@ export class Broker extends EventEmitter {
   fromDesktop(message) {
     if (message.method && Object.hasOwn(message, 'id')) {
       const id = `bridge:${++this.next}`;
-      this.routes.set(id, { desktopId: message.id, method: message.method });
+      this.routes.set(id, { desktopId: message.id, method: message.method, threadId: message.params?.threadId, cursor: this.cursor });
       this.send({ ...message, id });
     } else if (Object.hasOwn(message, 'id')) {
       // A request may already have been answered on the phone.
@@ -53,6 +57,11 @@ export class Broker extends EventEmitter {
         this.approvals.set(message.id, message);
       }
       const p = message.params;
+      if (message.method === 'thread/status/changed') {
+        this.threadStatus.set(p.threadId, p.status); this.statusCursors.set(p.threadId, this.cursor + 1);
+      }
+      if (message.method === 'thread/archived') this.archived.add(p.threadId);
+      if (message.method === 'thread/unarchived') this.archived.delete(p.threadId);
       if (message.method === 'turn/started') this.active.set(p.threadId, p.turn.id);
       if (message.method === 'turn/completed' && this.active.get(p.threadId) === p.turn.id) {
         this.active.delete(p.threadId);
@@ -65,6 +74,15 @@ export class Broker extends EventEmitter {
     const route = this.routes.get(message.id);
     if (!route) return;
     this.routes.delete(message.id);
+    if (route.method === 'thread/archive') this.archiving.delete(route.threadId);
+    if (!message.error) {
+      const threads = [...(Array.isArray(message.result?.data) ? message.result.data : []), message.result?.thread];
+      for (const thread of threads) {
+        if (thread?.id && thread.status && (this.statusCursors.get(thread.id) ?? 0) <= route.cursor) this.threadStatus.set(thread.id, thread.status);
+      }
+      if (route.method === 'thread/archive') this.archived.add(route.threadId);
+      if (route.method === 'thread/unarchive') this.archived.delete(route.threadId);
+    }
     if (Object.hasOwn(route, 'desktopId')) {
       // The desktop may omit the separate initialized notification.
       // Only the server's successful handshake response establishes readiness.
@@ -93,7 +111,7 @@ export class Broker extends EventEmitter {
     if (this.closed) return Promise.reject(new Error('App Server 已断开'));
     const id = `bridge:${++this.next}`;
     return new Promise((resolve, reject) => {
-      this.routes.set(id, { resolve, reject, command, method, threadId: params?.threadId });
+      this.routes.set(id, { resolve, reject, command, method, threadId: params?.threadId, cursor: this.cursor });
       this.send({ id, method, params });
     });
   }
@@ -119,6 +137,16 @@ export class Broker extends EventEmitter {
       throw new Error('独立模式只能操作本服务创建的任务，不能恢复桌面任务');
     }
     if (this.commands.size >= 5000) throw new Error('本次服务提交记录已满，请重启后继续');
+    if (['thread/archive', 'thread/unarchive'].includes(method) && (typeof params.threadId !== 'string' || !params.threadId)) throw new Error('缺少任务 ID');
+    if (method === 'thread/archive' && (this.active.has(params.threadId) || this.starting.has(params.threadId) ||
+        this.threadStatus.get(params.threadId)?.type === 'active' ||
+        [...this.approvals.values()].some(request => request.params?.threadId === params.threadId))) {
+      // A state change after the UI check is a known failure, never an unknown submission.
+      const command = { key, fingerprint, method, status: 'failed', error: { message: '任务正在运行或等待处理，请结束后再归档' } };
+      this.commands.set(key, command);
+      return command;
+    }
+    if ((this.archived.has(params.threadId) || this.archiving.has(params.threadId)) && ['thread/resume', 'turn/start', 'turn/steer'].includes(method)) throw new Error('会话已归档或正在归档，请先确认结果并恢复');
     if (method === 'turn/start' && (this.active.has(params.threadId) || this.starting.has(params.threadId))) {
       throw new Error('任务正在运行，请使用执行中追加，或等完成后发送');
     }
@@ -128,6 +156,7 @@ export class Broker extends EventEmitter {
     const command = { key, fingerprint, method, status: 'pending' };
     this.commands.set(key, command);
     if (method === 'turn/start') this.starting.add(params.threadId);
+    if (method === 'thread/archive') this.archiving.add(params.threadId);
     // Never retry an execution request on timeout. The client polls this receipt.
     this.rpc(method, params, command).catch(error => {
       command.status = this.closed ? 'unknown' : 'failed';
@@ -150,7 +179,7 @@ export class Broker extends EventEmitter {
   snapshot(after = 0) {
     return {
       ready: this.ready && !this.closed, cursor: this.cursor,
-      capabilities: { paginatedHistory: true, taskCommands: true },
+      capabilities: { paginatedHistory: true, taskCommands: true, taskArchive: true },
       reset: after > this.cursor || (this.events.length > 0 && after < this.events[0].cursor - 1),
       events: this.events.filter(e => e.cursor > after),
       active: Object.fromEntries(this.active),

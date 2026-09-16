@@ -14,7 +14,8 @@ try {
     const req = route.request(), url = new URL(req.url()); let data;
     if (url.pathname === '/api/state') data = { ready: true, capabilities: { paginatedHistory: true, taskCommands: true }, bridgeId: 'test', cursor, events: events.filter(event => event.cursor > Number(url.searchParams.get('after'))), active, approvals: [] };
     else if (url.pathname === '/api/projects') data = { projects: [], assignments: {} };
-    else if (url.pathname === '/api/uploads') data = { type: 'localImage', path: '/private/upload.png' };
+    else if (url.pathname === '/api/attachment-batches') data = { ok: true };
+    else if (url.pathname === '/api/attachments') data = { input: { type: 'localImage', path: '/private/upload.png' } };
     else if (url.pathname === '/api/commands') {
       const body = req.postDataJSON(); calls.push(body); let result;
       if (body.method === 'thread/list') result = { data: [thread], nextCursor: null };

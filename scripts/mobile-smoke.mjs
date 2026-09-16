@@ -110,12 +110,16 @@ try {
   assert.equal(await page.locator('.project-group').first().evaluate(el => el.open), false);
   await page.locator('#close-tasks').click();
   await page.locator('#new').click();
+  assert.equal(await page.locator('#workspace-choice').isVisible(), false);
+  await page.locator('#project-workspace > summary').click();
   await page.locator('#workspace-choice').selectOption('/repo/web');
   assert.match(await page.locator('#new-summary').innerText(), /组合项目/);
-  assert.match(await page.locator('#new-summary').innerText(), /\/repo\/web/);
+  assert.match(await page.locator('#new-summary').innerText(), /包含 2 个目录，可跨目录工作/);
+  assert.equal(await page.locator('#workspace-path').innerText(), '/repo/web');
   await page.screenshot({ path: new URL('../output/playwright/mobile-new-task.png', import.meta.url).pathname });
   await page.locator('#cancel-new').click();
   await page.locator('#new').click();
+  assert.equal(await page.locator('#workspace-choice').isVisible(), false);
   assert.equal(await page.locator('#workspace-choice').inputValue(), '/repo/web');
   await page.locator('#cancel-new').click();
 

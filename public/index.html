@@ -30,12 +30,12 @@
           <button type="button" data-message="采纳">采纳</button>
         </div>
         <div class="composer-box">
-        <input id="image-files" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
-        <div id="image-previews" aria-label="待发送图片" hidden></div>
-        <label for="message" class="sr-only">发送消息</label><textarea id="message" rows="1" required placeholder="发送消息，或粘贴截图" inputmode="text" enterkeyhint="enter" autocomplete="off" autocapitalize="sentences"></textarea>
+        <input id="image-files" type="file" accept=".png,.jpg,.jpeg,.webp,.txt,.md,.markdown,.log,.csv,.json,.jsonl,.ndjson,.yaml,.yml,.toml,.xml,.html,.htm,.css,.scss,.less,.js,.mjs,.cjs,.jsx,.ts,.tsx,.py,.rb,.go,.rs,.java,.c,.h,.cc,.cpp,.hpp,.cs,.swift,.kt,.kts,.sh,.bash,.zsh,.sql,.r,.vue,.svelte,.ini,.cfg,.conf,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx" multiple hidden>
+        <div id="image-previews" aria-label="待发送附件" hidden></div>
+        <label for="message" class="sr-only">发送消息</label><textarea id="message" rows="1" required placeholder="发送消息、添加文件或粘贴截图" inputmode="text" enterkeyhint="enter" autocomplete="off" autocapitalize="sentences"></textarea>
         <p id="model-label" class="muted small"></p>
         <div class="composer-tools" role="group" aria-label="消息操作">
-          <button id="attach-image" type="button" class="secondary" aria-label="上传图片或截图" title="上传图片或截图">＋</button>
+          <button id="attach-image" type="button" class="secondary" aria-label="添加图片或文件" title="添加图片或文件：最多 10 个、合计 50 MiB">＋</button>
           <button id="slash-toggle" type="button" class="secondary" title="命令" aria-label="打开命令菜单" aria-controls="slash-menu" aria-expanded="false"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4"/><path d="m7 9 3 3-3 3m6 0h4"/></svg></button>
           <button id="quick-toggle" type="button" class="secondary" title="快捷消息" aria-label="打开快捷消息" aria-controls="quick-menu" aria-expanded="false"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4h10a4 4 0 0 1 4 4v5a4 4 0 0 1-4 4h-6l-5 3v-4a4 4 0 0 1-3-4V8a4 4 0 0 1 4-4Z"/><circle cx="8" cy="10.5" r=".7" fill="currentColor" stroke="none"/><circle cx="12" cy="10.5" r=".7" fill="currentColor" stroke="none"/><circle cx="16" cy="10.5" r=".7" fill="currentColor" stroke="none"/></svg></button>
           <span class="composer-spacer" aria-hidden="true"></span>
@@ -58,11 +58,19 @@
       <button id="manage-devices" type="button" class="secondary wide">登录设备与安全记录</button>
       <section id="pending-tasks" aria-labelledby="pending-title" hidden><h3 id="pending-title">待处理</h3><p class="small muted">包含其他项目、筛选外及未加载的会话</p><div id="pending-task-list"></div><p id="pending-error" class="error" role="status"></p></section>
       <label for="task-search">搜索任务</label><input id="task-search" type="search" placeholder="标题、内容或任务 ID">
+      <label for="archive-filter">会话范围</label><select id="archive-filter"><option value="active">未归档</option><option value="archived">已归档</option></select>
+      <p id="archive-support" class="muted small" role="status"></p>
       <label for="project-filter">项目</label><select id="project-filter"><option value="">全部项目</option></select>
       <div class="toolbar"><button id="search-all" type="button">搜索历史标题</button><button id="recent-tasks" type="button" class="secondary">返回最近任务</button></div>
       <p id="task-count" class="muted small" role="status"></p><div id="task-list"></div>
       <button id="more" type="button" class="secondary wide" hidden>加载更多任务</button>
       <p id="search-scope" class="muted small">项目与桌面项目配置同步。输入可筛选已加载任务，也可搜索历史标题。</p>
+    </dialog>
+    <dialog id="archive-dialog" aria-labelledby="archive-title">
+      <h2 id="archive-title">归档会话</h2><p id="archive-target" style="overflow-wrap:anywhere"></p>
+      <p id="archive-hint" class="muted small">归档后可在“已归档”列表中恢复。未发送的草稿将保留在当前页面。</p>
+      <p id="archive-error" class="error" role="alert"></p>
+      <div class="toolbar"><button id="archive-confirm" type="button">确认归档</button><button id="archive-cancel" type="button" class="secondary" autofocus>取消</button><button id="archive-receipt" type="button" class="secondary" hidden>查询操作结果</button></div>
     </dialog>
     <dialog id="model-dialog" aria-labelledby="model-title" aria-describedby="model-hint">
       <form id="model-form">
@@ -101,11 +109,12 @@
         <label for="new-name">会话名称（可选）</label><input id="new-name" placeholder="留空使用默认名称" autocomplete="off" aria-describedby="new-name-hint">
         <p id="new-name-hint" class="muted small">之后也可以在会话列表中重命名。</p>
         <label for="project-choice">所属项目</label><select id="project-choice"></select>
-        <div id="project-workspace">
-          <label for="workspace-choice">组成部分 · 工作目录</label><select id="workspace-choice" aria-describedby="workspace-path"></select>
+        <details id="project-workspace">
+          <summary>高级选项：起始目录</summary>
+          <label for="workspace-choice">起始目录（可选调整）</label><select id="workspace-choice" aria-describedby="workspace-path workspace-hint"></select>
           <p id="workspace-path" class="muted small" style="overflow-wrap:anywhere"></p>
-          <p class="muted small">任务归属所选项目，在此目录中工作。</p>
-        </div>
+          <p id="workspace-hint" class="muted small">仅决定最初从哪里开始，会话仍可在项目的全部目录中工作。</p>
+        </details>
         <div id="custom-project"><label for="project-path">电脑上的项目路径</label><input id="project-path" required placeholder="/Users/你/Code/项目" autocapitalize="off" spellcheck="false"></div>
         <p id="new-summary" class="muted small" role="status"></p>
         <p id="new-error" class="error" role="alert"></p>

@@ -105,8 +105,8 @@ try {
     await page.setViewportSize({ width, height: 844 });
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `overflow at ${width}`);
     assert.equal(await page.locator('.task-card .task-rename').count(), 0);
-    const boxes = await row('one').locator('.task-card, .task-rename').evaluateAll(elements => elements.map(element => { const rect = element.getBoundingClientRect(); return { x: rect.x, right: rect.right, width: rect.width, height: rect.height }; }));
-    assert.ok(boxes[0].right <= boxes[1].x && boxes[0].width > 140 && boxes[1].height >= 44);
+    const boxes = await row('one').locator('.task-card, .task-rename').evaluateAll(elements => elements.map(element => { const rect = element.getBoundingClientRect(); return { x: rect.x, y: rect.y, bottom: rect.bottom, right: rect.right, width: rect.width, height: rect.height }; }));
+    assert.ok(boxes[0].bottom <= boxes[1].y && boxes[0].width > 140 && boxes[1].width >= 44 && boxes[1].height >= 44);
     if (width === 390) {
       await page.locator('#task-dialog').evaluate(element => { element.scrollTop = 0; });
       await page.screenshot({ path: `${artifacts}/sessions-mobile.png` });
@@ -118,11 +118,17 @@ try {
   await page.locator('#new').click();
   await page.locator('#new-name').fill('项目迭代会话');
   await page.locator('#project-choice').selectOption('alpha');
-  await page.locator('#workspace-choice').selectOption('/Code/shared');
+  assert.equal(await page.locator('#workspace-choice').isVisible(), false, 'creating within a project does not require choosing a directory');
+  assert.match(await page.locator('#new-summary').innerText(), /包含 2 个目录，可跨目录工作/);
+  for (const width of [320, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await page.screenshot({ path: `${artifacts}/project-new-${width}.png` });
+  }
   await page.screenshot({ path: `${artifacts}/new-mobile.png` });
   await page.locator('#create').click();
   await page.waitForFunction(() => document.querySelector('#conversation-title').textContent === '项目迭代会话');
-  assert.deepEqual(calls.find(call => call.method === 'thread/start').params, { cwd: '/Code/shared', projectId: 'native-alpha', runtimeWorkspaceRoots: ['/Code/shared'] });
+  assert.deepEqual(calls.find(call => call.method === 'thread/start').params, { cwd: '/Code/alpha', projectId: 'native-alpha', runtimeWorkspaceRoots: ['/Code/alpha', '/Code/shared'] });
   assert.equal(count('thread/start'), 1);
   await choose('one');
   assert.equal(await page.locator('#message').inputValue(), '保留消息草稿');
@@ -131,6 +137,8 @@ try {
   nextRename = 'failed';
   await page.locator('#new').click();
   await page.locator('#new-name').fill('失败后恢复名称');
+  await page.locator('#project-workspace > summary').click();
+  await page.locator('#workspace-choice').selectOption('/Code/shared');
   await page.locator('#create').click();
   await page.waitForFunction(() => document.querySelector('#command-error').textContent.includes('会话已创建'));
   assert.equal(await page.locator('#new-dialog').evaluate(element => element.open), false);
@@ -139,6 +147,7 @@ try {
   await page.locator('#command-save').click();
   await waitFormClosed();
   assert.equal(count('thread/start'), 2);
+  assert.deepEqual(calls.filter(call => call.method === 'thread/start')[1].params, { cwd: '/Code/shared', projectId: 'native-alpha', runtimeWorkspaceRoots: ['/Code/alpha', '/Code/shared'] });
   assert.equal(tasks.get(partialId).name, '失败后恢复名称');
 
   nextRename = 'unknown';

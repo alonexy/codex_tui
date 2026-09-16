@@ -34,7 +34,8 @@ try {
         data = { ...catalog, stale: mode === 'stale', models: mode === 'empty' ? [] : catalog.models };
       } else if (url.pathname === '/api/state') data = { ready: true, mode: 'desktop-shared', bridgeId: 'model-picker-mock', capabilities: { taskCommands: true }, active, approvals: [], cursor: eventCursor, events: Number(url.searchParams.get('after')) < eventCursor ? events : [] };
       else if (url.pathname === '/api/projects') data = { projects: [], assignments: {} };
-      else if (url.pathname === '/api/uploads') data = { type: 'localImage', path: '/mock/upload.png' };
+      else if (url.pathname === '/api/attachment-batches') data = { ok: true };
+      else if (url.pathname === '/api/attachments') data = { input: { type: 'localImage', path: '/mock/upload.png' } };
       else if (url.pathname === '/api/commands') {
         const call = request.postDataJSON(); calls.push(call); allCalls.push({ width, ...call });
         const { method, params } = call;

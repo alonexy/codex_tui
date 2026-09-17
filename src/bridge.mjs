@@ -13,11 +13,38 @@ const executable = process.env.CODEX_REAL_CLI ?? '/Applications/ChatGPT.app/Cont
 const subcommands = ['daemon', 'proxy', 'generate-ts', 'generate-json-schema', 'help'];
 const passthrough = !args.includes('app-server') || args.some(arg => ['--help', '-h', '--version'].includes(arg))
   || args.slice(args.indexOf('app-server') + 1).some(arg => subcommands.includes(arg));
+// Browser/Computer Use start their own config/policy App Servers through CODEX_CLI_PATH.
+// Identify that client before claiming the desktop socket. Keep the same iterator
+// for subsequent lines so coalesced initialize/notification messages are retained.
+const desktopInput = !standalone && !passthrough ? createInterface({ input: process.stdin }) : null;
+const desktopLines = desktopInput?.[Symbol.asyncIterator]();
+const firstLine = desktopLines ? await desktopLines.next() : null;
+if (firstLine?.done) process.exit(0);
+let nativeHelper = false;
+if (firstLine) {
+  try {
+    const message = JSON.parse(firstLine.value);
+    nativeHelper = message.method === 'initialize'
+      && ['codex-browser-use', 'codex-computer-use'].includes(message.params?.clientInfo?.name);
+  } catch { /* Invalid desktop JSON is reported by the normal protocol handler. */ }
+}
 // The desktop also invokes the CLI for non-server commands. Preserve those calls.
-if (!standalone && passthrough) {
-  const child = spawn(executable, args, { stdio: 'inherit' });
-  child.on('error', error => { console.error(error.message); process.exitCode = 1; });
-  child.on('exit', code => { process.exitCode = code ?? 1; });
+if (!standalone && (passthrough || nativeHelper)) {
+  const child = spawn(executable, args, { stdio: nativeHelper ? ['pipe', 'inherit', 'inherit'] : 'inherit' });
+  const closeInput = () => { desktopInput?.close(); if (nativeHelper) process.stdin.destroy(); };
+  child.on('error', error => { console.error(error.message); process.exitCode = 1; closeInput(); });
+  child.on('exit', code => { process.exitCode = code ?? 1; closeInput(); });
+  if (nativeHelper) {
+    child.stdin.on('error', error => {
+      if (error.code !== 'EPIPE') console.error(error.message);
+      closeInput();
+    });
+    process.on('SIGTERM', () => { closeInput(); child.kill('SIGTERM'); });
+    process.on('SIGINT', () => { closeInput(); child.kill('SIGINT'); });
+    child.stdin.write(`${firstLine.value}\n`);
+    for await (const line of desktopLines) child.stdin.write(`${line}\n`);
+    child.stdin.end();
+  }
 } else {
   let releaseOwnership = () => {};
   let spawned = false;
@@ -62,6 +89,7 @@ if (!standalone && passthrough) {
     const stop = (code = 0) => {
       if (stopping) return;
       stopping = true;
+      desktopInput?.close();
       broker.close();
       server.close();
       server.closeAllConnections();
@@ -82,17 +110,21 @@ if (!standalone && passthrough) {
       catch (error) { stop(1); throw error; }
     }
     else {
-      const desktop = createInterface({ input: process.stdin });
-      desktop.on('line', line => {
+      const receiveDesktop = line => {
         try { broker.fromDesktop(JSON.parse(line)); }
         catch (error) { console.error(`桌面协议错误：${error.message}`); stop(1); }
-      });
-      desktop.on('close', () => stop());
+      };
+      receiveDesktop(firstLine.value);
+      (async () => {
+        for await (const line of desktopLines) receiveDesktop(line);
+        stop();
+      })().catch(error => { console.error(error.message); stop(1); });
     }
     process.on('SIGINT', () => stop());
     process.on('SIGTERM', () => stop());
     console.error(`Codex 常驻桥接已启动，Web 服务可独立重启。模式：${standalone ? '独立' : '桌面共享'}`);
   } catch (error) {
+    desktopInput?.close();
     if (!spawned) releaseOwnership();
     console.error(error.message);
     process.exitCode = 1;

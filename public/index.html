@@ -23,13 +23,17 @@
       <form id="compose">
         <div id="approval-reminder" hidden><span id="approval-reminder-text" role="status" aria-live="polite"></span><button id="open-current-approval" type="button">去处理</button></div>
         <div id="slash-menu" role="region" aria-label="命令菜单" hidden></div>
-        <div id="quick-menu" aria-label="快捷消息" hidden>
-          <button type="button" data-message="继续">继续</button>
-          <button type="button" data-message="批准">批准</button>
-          <button type="button" data-message="确认">确认</button>
-          <button type="button" data-message="采纳">采纳</button>
-        </div>
         <div class="composer-box">
+        <div id="quick-menu" role="group" aria-labelledby="quick-title" hidden>
+          <div class="quick-heading"><strong id="quick-title">快捷指令</strong><span>点击立即发送</span></div>
+          <div class="quick-options">
+            <button type="button" data-message="继续">继续</button>
+            <button type="button" data-message="批准">批准</button>
+            <button type="button" data-message="确认">确认</button>
+            <button type="button" data-message="采纳">采纳</button>
+            <button type="button" data-message="推送远端" class="quick-push"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V3m-5 5 5-5 5 5M4 15v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg>推送远端</button>
+          </div>
+        </div>
         <input id="image-files" type="file" accept=".png,.jpg,.jpeg,.webp,.txt,.md,.markdown,.log,.csv,.json,.jsonl,.ndjson,.yaml,.yml,.toml,.xml,.html,.htm,.css,.scss,.less,.js,.mjs,.cjs,.jsx,.ts,.tsx,.py,.rb,.go,.rs,.java,.c,.h,.cc,.cpp,.hpp,.cs,.swift,.kt,.kts,.sh,.bash,.zsh,.sql,.r,.vue,.svelte,.ini,.cfg,.conf,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx" multiple hidden>
         <div id="image-previews" aria-label="待发送附件" hidden></div>
         <label for="message" class="sr-only">发送消息</label><textarea id="message" rows="1" required placeholder="发送消息、添加文件或粘贴截图" inputmode="text" enterkeyhint="enter" autocomplete="off" autocapitalize="sentences"></textarea>

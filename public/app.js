@@ -1614,20 +1614,33 @@ $('slash-toggle').onclick = () => {
   if (!$('slash-menu').hidden) { $('slash-menu').hidden = true; $('slash-toggle').setAttribute('aria-expanded', 'false'); return; }
   showSlashMenu(true);
 };
+// Keep focus from moving the toolbar between touch release and the resulting click.
+$('quick-toggle').addEventListener('pointerdown', event => event.preventDefault());
 $('quick-toggle').onclick = () => {
   const open = $('quick-menu').hidden;
+  $('message').blur();
   $('quick-menu').hidden = !open;
   $('quick-toggle').setAttribute('aria-expanded', String(open));
   $('slash-menu').hidden = true; $('slash-toggle').setAttribute('aria-expanded', 'false');
+  (open ? $('quick-menu').querySelector('button') : $('quick-toggle')).focus({ preventScroll: true });
+  if (open) $('quick-menu').scrollIntoView({ block: 'nearest', behavior: 'instant' });
 };
 $('quick-menu').addEventListener('click', event => {
   const button = event.target.closest('button[data-message]');
   if (!button || button.disabled) return;
   $('quick-menu').hidden = true; $('quick-toggle').setAttribute('aria-expanded', 'false');
+  $('quick-toggle').focus({ preventScroll: true });
   send(!!active[threadId], button.dataset.message).catch(showError);
 });
+document.addEventListener('pointerdown', event => {
+  if ($('quick-menu').hidden || $('quick-menu').contains(event.target) || $('quick-toggle').contains(event.target)) return;
+  $('quick-menu').hidden = true; $('quick-toggle').setAttribute('aria-expanded', 'false');
+});
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape') { $('quick-menu').hidden = true; $('quick-toggle').setAttribute('aria-expanded', 'false'); }
+  if (event.key === 'Escape' && !$('quick-menu').hidden) {
+    $('quick-menu').hidden = true; $('quick-toggle').setAttribute('aria-expanded', 'false');
+    $('quick-toggle').focus({ preventScroll: true });
+  }
 });
 $('jump-approvals').onclick = locateApproval;
 $('open-current-approval').onclick = locateApproval;

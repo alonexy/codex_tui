@@ -120,7 +120,7 @@ main { max-width: 800px; padding-top: 4px; }
 #events { min-height: 0; }
 #compose { position: sticky; bottom: 0; z-index: 2; padding: 10px 0 calc(10px + env(safe-area-inset-bottom)); border: 0; }
 #message { border-radius: 18px; background: #282828; min-height: 72px; max-height: 22dvh; }
-.composer-box { border: 1px solid var(--border); border-radius: 22px; background: #282828; padding: 4px 8px 8px; }
+.composer-box { position: relative; border: 1px solid var(--border); border-radius: 22px; background: #282828; padding: 4px 8px 8px; }
 .composer-box #message { display: block; border: 0; border-radius: 16px; resize: none; min-height: 44px; padding: 8px 10px; }
 .composer-tools { --control-size: 48px; display: flex; align-items: center; gap: 4px; padding-top: 10px; }
 .composer-spacer { flex: 1; min-width: 0; }
@@ -148,8 +148,16 @@ main { max-width: 800px; padding-top: 4px; }
 @media (max-width: 380px) { main { padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); } .composer-tools { --control-size: 44px; gap: 2px; } }
 #stop { font-size: 17px; background: #444; border: 0; color: var(--text); }
 #quick-toggle { border: 0; background: transparent; color: var(--muted); }
-#quick-menu { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 8px 0; }
-#quick-menu button { min-height: 40px; padding: 6px 16px; background: var(--surface); color: var(--text); }
+#quick-toggle, #quick-menu button { -webkit-tap-highlight-color: transparent; }
+#quick-toggle[aria-expanded="true"] { color: var(--text); background: #404040; }
+#quick-menu { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 3; width: min(300px, 100%); max-height: min(360px, calc(100dvh - 100px)); overflow-y: auto; overscroll-behavior: contain; padding: 12px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: 0 8px 28px #0005; }
+.quick-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 2px 4px 10px; font-size: .8rem; }
+.quick-heading span { color: var(--muted); font-size: .75rem; }
+.quick-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+#quick-menu button { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 48px; padding: 10px 12px; border-radius: 12px; background: #303030; color: var(--text); }
+#quick-menu .quick-push { grid-column: 1 / -1; }
+#quick-menu button:active { background: #484848; }
+@media (hover: hover) { #quick-menu button:hover { background: #3b3b3b; } }
 #turn-loading { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: .8rem; margin: 12px 0; }
 .loading-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: loading-pulse 1s ease-in-out infinite alternate; }
 @keyframes loading-pulse { to { opacity: .25; } }

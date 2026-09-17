@@ -129,7 +129,7 @@ try {
   networkDown = true;
   await page.waitForFunction(() => document.querySelector('#status').textContent.includes('连接中断'));
   assert.match(await page.locator('#approval-reminder').innerText(), /待核对/);
-  assert.equal(await card('question').locator('button').isDisabled(), true);
+  assert.equal(await card('question').locator('.question-send').isDisabled(), true);
   assert.match(await page.locator('#connection-error').innerText(), /Failed to fetch/);
   await page.evaluate(() => { document.querySelector('#error').textContent = '尚未解决的其他操作错误'; });
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
@@ -144,10 +144,10 @@ try {
   assert.equal(await page.locator('#error').textContent(), '尚未解决的其他操作错误');
   await page.evaluate(() => { document.querySelector('#error').textContent = ''; });
   await choosePending('one');
-  await card('question').locator('button').click();
+  await card('question').locator('.question-send').click();
   assert.deepEqual(answers, [{ id: 'question', result: { answers: { q: { answers: ['保留尚未提交的回答'] } } } }]);
   await nextPoll();
-  assert.equal(await card('question').locator('button').isDisabled(), true, 'submitted requests stay locked until snapshot resolution');
+  assert.equal(await card('question').locator('.question-send').isDisabled(), true, 'submitted requests stay locked until snapshot resolution');
   approvals = approvals.filter(item => item.id !== 'question');
   emit(waiting('one', []), { method: 'serverRequest/resolved', params: { threadId: 'one', requestId: 'question' } });
   await page.locator('#approval-reminder').waitFor({ state: 'hidden' });

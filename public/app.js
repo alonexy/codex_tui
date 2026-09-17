@@ -7,6 +7,8 @@ import { taskPreferences } from './task-preferences.js';
 import { DeliveryState, deliveryLabel } from './delivery-state.js';
 import { devicePanel } from './device-panel.js';
 import { ApprovalState, approvalLabel, isAnswerable } from './approval-state.js';
+import { PlanMode, modeLabel } from './plan-mode.js';
+import { questionCard } from './question-card.js';
 const $ = id => document.getElementById(id);
 sessionStorage.removeItem('codex-token');
 let threadId = '';
@@ -32,6 +34,7 @@ let tasksLoaded = false;
 let paginatedHistory = false;
 let taskCommands = false;
 let taskArchive = false;
+let threadModeReads = false;
 let archivedView = false;
 let archiveBusy = false;
 const archiveStates = new Map();
@@ -58,13 +61,17 @@ const fileAttachments = new Map();
 const modelOverrides = new Map();
 const defaultModels = new Map();
 const modelSettingVersions = new Map();
+const planMode = new PlanMode(sessionStorage);
 let submittedModelSetting = null;
+const modeReads = new Map();
+const modeReadAt = new Map();
 const slashCommands = [
   ['/new', '新建会话', '任务'], ['/resume', '切换会话', '任务'],
   ['/rename', '重命名当前会话', '任务'], ['/compact', '压缩当前上下文', '任务'],
   ['/stop', '停止当前执行', '任务'],
   ['/goal', '创建目标、设置预算、暂停或继续', '目标'],
   ['/model', '选择下轮模型与推理强度', '模型与状态'], ['/status', '当前会话状态', '模型与状态'],
+  ['/plan', '下轮切换为计划模式', '模型与状态'], ['/default', '下轮切换为执行模式', '模型与状态'],
   ['/approvals', '查看待审批请求', '模型与状态'], ['/help', '查看命令帮助', '模型与状态'],
 ];
 function requireTaskCommands() {
@@ -90,7 +97,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function scrollToLatest() {
   cancelAnimationFrame(scrollFrame);
   scrollFrame = requestAnimationFrame(() => {
-    if (!followingLatest || document.activeElement === $('message') || $('task-dialog').open || $('new-dialog').open) return;
+    if (!followingLatest || document.activeElement === $('message') || document.activeElement?.closest?.('.approval-card') || $('task-dialog').open || $('new-dialog').open) return;
     $('events').scrollTop = $('events').scrollHeight;
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' });
   });
@@ -141,6 +148,7 @@ async function command(method, params = {}, sessionName) {
   const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
   if (execution) {
     delivery.begin(key, method, params.threadId, method === 'thread/name/set' ? params.name : sessionName);
+    if (method === 'turn/start') planMode.begin(key, params.threadId, params);
     uncertainSubmission = true;
     if (submittedDraft && ['turn/start', 'turn/steer'].includes(method)) submittedDraft.key = key;
     if (submittedModelSetting && method === 'turn/start') submittedModelSetting.key = key;
@@ -148,21 +156,23 @@ async function command(method, params = {}, sessionName) {
   try {
     await api('/api/commands', { key, method, params });
     const result = await receipt(key);
-    if (execution) { delivery.settle(key, 'completed', result); uncertainSubmission = false; }
+    if (execution) { delivery.settle(key, 'completed', result); planMode.finish(key, true); uncertainSubmission = false; }
     return result;
   } catch (error) {
     // Keep an uncertain execution receipt across page reloads. Never replay it automatically.
     if (execution) {
-      if (error.receiptStatus === 'failed' || error.submission === 'rejected') delivery.settle(key, 'failed');
+      if (error.receiptStatus === 'failed' || error.submission === 'rejected') { delivery.settle(key, 'failed'); planMode.finish(key, false); }
       else try {
         const record = await api(`/api/commands/${encodeURIComponent(key)}`);
         if (record.status === 'completed') {
           delivery.settle(key, 'completed', record.result); uncertainSubmission = false;
+          planMode.finish(key, true);
           for (const [path, url] of Object.entries(record.media ?? {})) mediaUrls.set(path, url);
           for (const [path, file] of Object.entries(record.files ?? {})) fileAttachments.set(path, file);
           return record.result;
         }
         delivery.settle(key, record.status);
+        if (record.status === 'failed') planMode.finish(key, false);
       } catch { /* Unknown submission: only query its receipt, never replay execution. */ }
       uncertainSubmission = !!delivery.pending;
     }
@@ -180,6 +190,7 @@ async function recoverSubmission() {
     uncertainSubmission = false;
     const id = pending.threadId || record.result?.thread?.id || threadId;
     const success = record.status === 'completed';
+    planMode.finish(pending.key, success);
     if (submittedModelSetting?.key === pending.key) finishModelSubmission(success);
     deliveryOutcomes.set(id, success ? '已接收 · 回执已确认' : '发送失败 · 服务已确认，可修改后重试');
     if (success) {
@@ -788,6 +799,8 @@ async function select(id) {
       result.thread.turns = page.thread.turns;
     }
     if (request !== selection || archiveStates.get(id)) return;
+    await syncThreadMode(id);
+    if (request !== selection || archiveStates.get(id)) return;
     const switched = threadId !== id;
     if (result.model && !defaultModels.has(id)) defaultModels.set(id, result.model);
     if (threadId) drafts.set(threadId, $('message').value);
@@ -811,6 +824,28 @@ async function select(id) {
   } finally {
     if (request === selection) { selecting = false; selectingThread = ''; updateControls(); renderTasks(); }
   }
+}
+
+async function syncThreadMode(id) {
+  if (!threadModeReads) return;
+  if (modeReads.has(id)) return modeReads.get(id);
+  const token = planMode.token(id);
+  const request = (async () => {
+    try {
+      const result = await api(`/api/thread-mode?threadId=${encodeURIComponent(id)}`);
+      planMode.acceptRead(id, result, token, active[id]);
+    } catch { /* A missing source does not block opening the task or imply execution mode. */ }
+    finally { modeReadAt.set(id, Date.now()); modeReads.delete(id); }
+  })();
+  modeReads.set(id, request);
+  return request;
+}
+
+function setModeMenu(open, restoreFocus = false) {
+  const expanded = open && !$('plan-mode').disabled;
+  $('plan-mode-menu').hidden = !expanded;
+  $('plan-mode').setAttribute('aria-expanded', String(expanded));
+  if (restoreFocus && !$('plan-mode').disabled) $('plan-mode').focus({ preventScroll: true });
 }
 
 function updateControls() {
@@ -852,6 +887,24 @@ function updateControls() {
   $('choose-task').disabled = $('workspace').hidden;
   $('compose-hint').textContent = selecting ? '正在切换会话…' : !threadId ? '选择会话，或输入 /new 新建' : '';
   $('model-label').textContent = pendingModelLabel(threadId);
+  const knownMode = planMode.known.get(threadId), nextMode = planMode.choices.get(threadId);
+  const displayMode = planMode.display(threadId);
+  $('compose').dataset.collaborationMode = knownMode ?? 'unknown';
+  $('plan-mode-title').textContent = knownMode === 'plan' ? '计划模式' : '模式';
+  $('plan-mode').value = nextMode ?? '';
+  $('plan-mode-value').textContent = nextMode || displayMode.mode ? modeLabel(nextMode ?? displayMode.mode) : '选择模式';
+  $('plan-mode').title = displayMode.source === 'last-turn' ? '来自最近一轮执行记录，不代表桌面尚未发送的选择' : displayMode.source === 'current-turn' ? '已同步本轮执行模式' : displayMode.mode ? '已同步运行设置' : '尚未取得会话模式，可明确选择下轮模式';
+  $('plan-mode').disabled = !threadId || sending || selecting || stopping || slashBusy || creating || archiveBusy || uncertainSubmission || !!archiveStates.get(threadId);
+  if ($('plan-mode').disabled) setModeMenu(false);
+  for (const mode of ['default', 'plan']) {
+    $(`plan-mode-${mode}`).disabled = $('plan-mode').disabled;
+    $(`plan-mode-${mode}`).setAttribute('aria-pressed', String(mode === (nextMode ?? displayMode.mode)));
+  }
+  $('plan-mode-clear').hidden = (nextMode ?? knownMode) !== 'plan';
+  $('plan-mode-clear').disabled = $('plan-mode').disabled;
+  $('plan-mode-label').textContent = !threadId ? '选择会话后可设置模式' : nextMode
+    ? `下轮：${modeLabel(nextMode)}（${planMode.pending?.id === threadId ? '提交待确认' : '尚未发送'}）${running ? '；当前执行不变' : ''}`
+    : displayMode.mode && displayMode.source === 'last-turn' ? '最近一轮' : displayMode.mode && displayMode.source === 'current-turn' ? '本轮' : '';
   updateModelAvailability();
   resizeMessage();
   renderTaskStates();
@@ -883,20 +936,24 @@ function resizeMessage() {
 
 function syncKeyboard() {
   const viewport = window.visualViewport;
-  const focused = document.activeElement === $('message');
-  const inset = focused && viewport && viewport.scale === 1
+  const focused = document.activeElement === $('message') || !!document.activeElement?.closest?.('#questions input, #questions textarea');
+  const inset = viewport && viewport.scale === 1
     ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop) : 0;
   document.documentElement.style.setProperty('--keyboard-inset', `${inset}px`);
-  document.body.classList.toggle('composing', focused);
+  document.documentElement.style.setProperty('--dock-height', `${Math.max(180, (viewport?.height || window.innerHeight || 800) - 84)}px`);
+  document.body.classList.toggle('composing', inset > 80);
   resizeMessage();
   if (focused) requestAnimationFrame(() => {
     const bottom = (viewport?.height || window.innerHeight) + (viewport?.offsetTop || 0);
-    const overflow = $('compose').getBoundingClientRect().bottom - bottom;
+    const overflow = $('interaction-dock').getBoundingClientRect().bottom - bottom;
     if (overflow > 1) window.scrollBy(0, overflow + 8);
+    if (document.activeElement?.closest?.('#questions')) document.activeElement.scrollIntoView({ block: 'nearest' });
   });
 }
 $('message').addEventListener('focus', syncKeyboard);
 $('message').addEventListener('blur', syncKeyboard);
+$('questions').addEventListener('focusin', syncKeyboard);
+$('questions').addEventListener('focusout', () => requestAnimationFrame(syncKeyboard));
 window.visualViewport?.addEventListener('resize', syncKeyboard);
 window.visualViewport?.addEventListener('scroll', syncKeyboard);
 window.addEventListener('resize', syncKeyboard);
@@ -907,8 +964,8 @@ function commandUnavailable(name, targetId = threadId) {
   if (slashBusy || sending || stopping || selecting || creating) return '请等待当前操作完成';
   if (['/new', '/resume', '/rename', '/compact', '/goal', '/stop'].includes(name) && !connected) return '桌面连接尚未就绪';
   if (['/rename', '/compact', '/goal'].includes(name) && !taskCommands) return '驻留桥接尚未支持此命令；请在任务结束后重启桌面 App';
-  if (['/model', '/rename', '/compact', '/goal', '/stop', '/approvals'].includes(name) && !targetId) return '请先选择任务';
-  if (['/new', '/rename', '/compact', '/goal', '/stop'].includes(name) && uncertainSubmission) return '请先查询上次提交结果';
+  if (['/model', '/plan', '/default', '/rename', '/compact', '/goal', '/stop', '/approvals'].includes(name) && !targetId) return '请先选择任务';
+  if (['/new', '/plan', '/default', '/rename', '/compact', '/goal', '/stop'].includes(name) && uncertainSubmission) return '请先查询上次提交结果';
   if (name === '/compact' && active[threadId]) return '请等待当前执行结束后再压缩上下文';
   if (name === '/stop' && !active[threadId]) return '当前没有正在执行的任务';
   if (name === '/approvals' && $('jump-approvals').hidden) return '当前没有待审批请求';
@@ -1228,6 +1285,9 @@ async function executeSlash(text, preserveDraft = false) {
     if (!model.defaultReasoningEffort) throw Error('目录未提供此模型的默认强度，请打开 /model 选择推理强度');
     saveModelSetting(id, model, model.defaultReasoningEffort);
     if (reset) $('command-feedback').textContent += ' 已重置为首次连接的型号及该型号的目录默认强度。';
+  } else if (name === '/plan' || name === '/default') {
+    planMode.choose(threadId, name === '/plan' ? 'plan' : 'default');
+    $('command-feedback').textContent = `下轮将使用${modeLabel(planMode.choices.get(threadId))}模式；发送消息后生效。`;
   } else if (name === '/status') {
     $('command-feedback').textContent = `${connected ? '已连接' : '未连接'} · ${threadId ? $('conversation-title').textContent : '未选择会话'} · ${active[threadId] ? '正在执行' : '空闲'}`;
     renderStatus();
@@ -1282,11 +1342,11 @@ function renderStatus() {
 }
 
 function locateApproval() {
-  const card = $('approvals').querySelector('.approval-card');
+  const card = $('approvals').querySelector('.approval-card') || $('questions').querySelector('.approval-card');
   if (!card) return;
   followingLatest = false;
   cancelAnimationFrame(scrollFrame);
-  card.scrollIntoView({ block: 'start' });
+  card.scrollIntoView({ block: 'nearest' });
   card.focus({ preventScroll: true });
 }
 
@@ -1327,6 +1387,7 @@ function renderApprovalReminders() {
   }
   for (const article of approvalCards.values()) {
     for (const control of article.querySelectorAll('button, input, select')) control.disabled = !connected || selecting || article.dataset.responding === 'true';
+    article.questionControls?.setLocked(!connected || selecting || article.dataset.responding === 'true');
   }
 }
 
@@ -1352,6 +1413,7 @@ function renderApprovals() {
     article.dataset.requestId = String(request.id);
     const heading = document.createElement('h2');
     const isQuestion = request.method === 'item/tool/requestUserInput';
+    article.dataset.question = String(isQuestion);
     heading.textContent = !isAnswerable(request) ? '需在桌面处理' : isQuestion ? '需要你的回答' : request.method === 'item/fileChange/requestApproval' ? '允许修改文件？' : '允许执行命令？';
     article.append(heading);
     for (const [label, value] of [['原因', request.params.reason], ['工作目录', request.params.cwd], ['命令', request.params.command], ['申请写入目录', request.params.grantRoot]]) {
@@ -1391,35 +1453,8 @@ function renderApprovals() {
     if (!isAnswerable(request)) {
       feedback.textContent = '此请求暂不支持在手机处理，请打开桌面 Codex 核对。';
     } else if (isQuestion) {
-      const form = document.createElement('form');
-      const inputs = [];
-      for (const question of request.params.questions) {
-        const label = document.createElement('label');
-        label.textContent = question.question;
-        const input = document.createElement('input');
-        input.required = true;
-        input.type = question.isSecret ? 'password' : 'text';
-        input.autocomplete = 'off';
-        if (question.options?.length && !question.isSecret) {
-          const choices = document.createElement('select');
-          choices.setAttribute('aria-label', `${question.question}：建议选项`);
-          choices.add(new Option('选择建议答案，或在下面填写', ''));
-          for (const option of question.options) choices.add(new Option(`${option.label}${option.description ? ' — ' + option.description : ''}`, option.label));
-          choices.onchange = () => { input.value = choices.value; };
-          label.append(choices);
-        }
-        label.append(input);
-        form.append(label);
-        inputs.push([question.id, input]);
-      }
-      const button = document.createElement('button');
-      button.textContent = '提交回答';
-      form.append(button);
-      form.onsubmit = event => {
-        event.preventDefault();
-        respond({ answers: Object.fromEntries(inputs.map(([id, input]) => [id, { answers: [input.value] }])) });
-      };
-      article.append(form);
+      article.questionControls = questionCard(request.params.questions ?? [], respond);
+      article.append(article.questionControls.form);
     } else {
       for (const [text, decision] of [['允许这一次', 'accept'], ['拒绝', 'decline']]) {
         const button = document.createElement('button');
@@ -1442,10 +1477,16 @@ function renderApprovals() {
     card.append(heading, detail); cards.push(card);
   }
   // Removing a sibling request must not detach the form the user is typing in.
-  for (const card of [...$('approvals').children]) if (!cards.includes(card)) card.remove();
-  cards.forEach((card, index) => {
-    if ($('approvals').children[index] !== card) $('approvals').insertBefore(card, $('approvals').children[index] ?? null);
-  });
+  for (const [id, question] of [['approvals', false], ['questions', true]]) {
+    const container = $(id);
+    const entries = cards.filter(card => (card.dataset.question === 'true') === question);
+    for (const card of [...container.children]) if (!entries.includes(card)) card.remove();
+    entries.forEach((card, index) => {
+      if (container.children[index] !== card) container.insertBefore(card, container.children[index] ?? null);
+    });
+    if (question) container.hidden = !entries.length;
+  }
+  syncKeyboard();
   renderApprovalReminders();
 }
 
@@ -1462,6 +1503,7 @@ async function poll() {
     paginatedHistory = !!state.capabilities?.paginatedHistory;
     taskCommands = !!state.capabilities?.taskCommands;
     taskArchive = !!state.capabilities?.taskArchive;
+    threadModeReads = !!state.capabilities?.threadMode;
     $('status').textContent = state.ready ? '已连接' : '等待 App Server';
     $('mode').textContent = state.mode === 'desktop-shared' ? '桌面共享连接 · 手机关闭后任务继续运行' : state.mode === 'standalone' ? '独立服务 · 此连接不控制桌面任务' : 'Web 已连接，等待桌面桥接；无需重启 Web。';
     const changed = bridgeId && state.bridgeId && state.bridgeId !== bridgeId;
@@ -1472,6 +1514,8 @@ async function poll() {
       for (const [id, archived] of archiveStates) if (!archived) archiveStates.delete(id);
     }
     active = state.active ?? {};
+    planMode.snapshot(state.threadSettings, changed || !!state.reset);
+    planMode.active(active);
     pendingApprovals.snapshot(state, changed);
     for (const event of state.events ?? []) {
       if (['thread/archived', 'thread/unarchived'].includes(event.method) && event.params?.threadId) {
@@ -1527,6 +1571,7 @@ async function poll() {
       if (event.method === 'thread/settings/updated' && event.params?.threadId) {
         const id = event.params.threadId, settings = event.params.threadSettings;
         if (settings) {
+          if (Object.hasOwn(settings, 'collaborationMode')) planMode.observe(id, settings.collaborationMode);
           modelSettingVersions.set(id, (modelSettingVersions.get(id) ?? 0) + 1);
           rememberThreadStatus(id, { model: settings.model ?? null, reasoningEffort: settings.effort ?? null });
           if ($('model-dialog').open && $('model-dialog').dataset.threadId === id && id === threadId) {
@@ -1563,6 +1608,10 @@ async function poll() {
       needsHistoryRefresh = false;
     }
     if (currentThread && selected === selection) renderHistory(timeline.thread(currentThread), true);
+    if (connected && currentThread && selected === selection && !selecting && !sending && !modeReads.has(currentThread) &&
+        ((state.events ?? []).some(event => event.params?.threadId === currentThread && ['turn/started', 'turn/completed'].includes(event.method)) || Date.now() - (modeReadAt.get(currentThread) ?? 0) > 15000)) {
+      await syncThreadMode(currentThread);
+    }
     cursor = state.cursor;
     updateControls();
     if (followingLatest) scrollToLatest();
@@ -1769,6 +1818,7 @@ $('reconcile').onclick = () => {
     : '请先刷新并检查任务历史。清除记录不会取消已提交的指令；确定已核对执行状态？';
   if (!confirm(message)) return;
   delivery.clear();
+  if (planMode.pending) planMode.finish(planMode.pending.key, false);
   submittedDraft = null;
   uncertainSubmission = false;
   $('reconcile').hidden = true;
@@ -1795,7 +1845,7 @@ async function send(steer, quickText) {
     await command(steer ? 'turn/steer' : 'turn/start', {
       threadId, input: [...(text.trim() ? [{ type: 'text', text }] : []), ...attachments],
       ...(steer ? { expectedTurnId: active[threadId] } : {}),
-      ...(submittedModelSetting?.setting ?? {}),
+      ...planMode.params(threadId, currentModelSetting(threadId), submittedModelSetting?.setting, steer),
     });
     finishModelSubmission(true);
     freshThreads.delete(threadId);
@@ -1814,6 +1864,17 @@ async function send(steer, quickText) {
   } finally { sending = false; updateControls(); }
 }
 $('message').addEventListener('compositionstart', () => { composingText = true; });
+$('plan-mode').onclick = () => setModeMenu($('plan-mode-menu').hidden);
+for (const mode of ['default', 'plan']) $(`plan-mode-${mode}`).onclick = () => {
+  if ($('plan-mode').disabled) return;
+  planMode.choose(threadId, mode); setModeMenu(false, true); updateControls();
+};
+const modeEscape = event => {
+  if (event.key === 'Escape' && !$('plan-mode-menu').hidden) { event.preventDefault(); setModeMenu(false, true); }
+};
+$('plan-mode').onkeydown = modeEscape;
+$('plan-mode-menu').onkeydown = modeEscape;
+$('plan-mode-clear').onclick = () => { planMode.choose(threadId, planMode.known.get(threadId) === 'plan' ? 'default' : ''); setModeMenu(false, true); updateControls(); };
 $('message').addEventListener('compositionend', () => { composingText = false; });
 $('compose').onsubmit = event => { event.preventDefault(); send(!!active[threadId]).catch(showError); };
 $('stop').onclick = async () => {

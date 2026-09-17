@@ -210,6 +210,63 @@ main { max-width: 800px; padding-top: 4px; }
 #open-current-approval { flex: 0 0 auto; min-height: 44px; padding: 8px 12px; border-color: #bfa26b; background: #f4d49a; color: #30220c; font-size: .8rem; }
 .approval-card { scroll-margin-top: calc(84px + env(safe-area-inset-top)); }
 .approval-card:focus { outline: 2px solid #f4d49a; outline-offset: 3px; }
+.composer-mode-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; margin: 0 4px 8px; }
+.plan-mode-control { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; border-radius: 24px; background: #292929; color: #c4c4c4; }
+#plan-mode { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; width: auto; min-width: 48px; max-width: 100%; height: 30px; min-height: 30px; padding: 3px 10px; font-size: .875rem; line-height: 24px; border: 0; border-radius: 24px; background: transparent; color: inherit; }
+#plan-mode-clear { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 30px; min-height: 30px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; }
+#plan-mode-clear span { display: grid; place-items: center; width: 14px; height: 14px; border-radius: 50%; background: #777; color: #eee; font-size: 12px; line-height: 1; }
+#plan-mode-clear:not([hidden]) + #plan-mode { padding-left: 0; }
+#plan-mode-menu { display: flex; gap: 8px; width: fit-content; max-width: 100%; margin: 0 4px 10px; padding: 8px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+#plan-mode-menu button { flex: 0 0 88px; min-height: 44px; padding: 8px 12px; }
+#plan-mode-menu button[aria-pressed="true"] { border-color: #aa98eb; color: #ded2ff; background: #40374f; }
+#plan-mode-label { flex: 0 1 auto; max-width: calc(100% - 128px); margin: 0 0 0 auto; font-size: .75rem; text-align: right; }
+#plan-mode-label:empty { display: none; }
+#compose[data-collaboration-mode="plan"] .composer-box { border-color: #aa98eb; background: #2b2738; box-shadow: inset 0 0 0 1px #aa98eb33; }
+#compose[data-collaboration-mode="plan"] #message { background: transparent; }
+#compose[data-collaboration-mode="plan"] .plan-mode-control { color: #ded2ff; background: #40374f; }
+.question-form { min-width: 0; }
+.question-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.question-collapse { min-height: 44px; padding: 6px 12px; border: 0; font-size: .8rem; }
+.question-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 16px; }
+.question-tabs button { min-width: 44px; min-height: 44px; padding: 8px 12px; }
+.question-tabs button[aria-pressed="true"] { color: var(--bg); background: var(--accent); }
+.question-header { font-size: .8rem; color: var(--muted); margin: 8px 0; }
+.question-panel h3 { font-size: 1rem; line-height: 1.6; margin: 8px 0 16px; }
+.question-option { display: flex; width: 100%; align-items: flex-start; gap: 12px; margin: 8px 0; padding: 12px; text-align: left; border-color: #484848; border-radius: 12px; }
+.question-option[aria-pressed="true"] { border-color: #f4d49a; background: #343029; box-shadow: inset 0 0 0 1px #f4d49a; }
+.question-number { flex: 0 0 24px; width: 24px; height: 24px; display: grid; place-items: center; font-size: .8rem; border: 1px solid #666; border-radius: 6px; }
+.question-option > span:last-child { min-width: 0; }
+.question-option strong { font-size: .9rem; font-weight: 550; }
+.question-description { display: block; font-size: .8rem; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+.question-navigation { display: flex; gap: 8px; margin-top: 16px; }
+.question-navigation button { flex: 1; }
+.question-send { width: 100%; margin-top: 12px; }
+/* Questions and the message form are siblings in one bottom dock. */
+#interaction-dock { position: sticky; bottom: var(--keyboard-inset, 0px); z-index: 2; display: flex; flex-direction: column; max-height: var(--dock-height, calc(100dvh - 84px)); background: var(--bg); }
+#workspace { display: flex; flex-direction: column; min-height: calc(100dvh - 76px - env(safe-area-inset-top)); }
+main:has(#interaction-dock) { padding-bottom: 0; }
+#interaction-dock { margin-top: auto; }
+#interaction-dock #compose { position: static; flex: 0 0 auto; min-height: 0; }
+#questions { display: flex; flex-direction: column; min-height: 0; gap: 8px; overflow-y: auto; overscroll-behavior: contain; }
+#questions .approval-card { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; margin: 0; padding: 8px 12px; border-radius: 16px; }
+#questions .approval-card > h2 { display: none; }
+#questions .approval-card > [role="status"] { flex: 0 0 auto; margin: 4px 0; font-size: .75rem; }
+#questions .approval-card > [role="status"]:empty { display: none; }
+#questions .question-form, #questions .question-body { display: flex; flex-direction: column; min-height: 0; }
+#questions .question-top, #questions .question-tabs, #questions .question-footer { flex: 0 0 auto; }
+#questions .question-scroll { min-height: 48px; overflow-y: auto; overscroll-behavior: contain; }
+#questions .question-tabs { margin: 0 0 4px; }
+#questions .question-footer { display: flex; gap: 8px; padding-top: 6px; }
+#questions .question-navigation { flex: 2; margin: 0; gap: 6px; }
+#questions .question-send { flex: 1; width: auto; margin: 0; }
+#questions .question-footer button { min-height: 44px; padding: 6px; font-size: .8rem; }
+#questions input { font-size: 16px; }
+#questions .collapsed { flex: 0 0 auto; }
+.composing #interaction-dock:has(#questions:not([hidden])) #compose { max-height: calc(var(--dock-height, 100dvh) * .48); overflow-y: auto; }
+.composing #interaction-dock:has(#questions:not([hidden])) #approval-reminder { display: none; }
+@media (max-height: 540px) {
+  #interaction-dock:has(#questions:not([hidden])) #compose { max-height: 38%; overflow-y: auto; }
+}
 .task-state[data-state="waiting"], .pending-badge { color: #f4d49a; }
 .pending-badge { display: inline-block; font-size: .7rem; font-weight: 500; margin-left: 8px; padding: 2px 7px; border: 1px solid #78633e; border-radius: 10px; }
 #pending-tasks { margin: 16px 0; padding: 12px; border: 1px solid #78633e; border-radius: 12px; }

@@ -8,6 +8,25 @@ const allowed = new Set(['thread/list', 'thread/read', 'thread/start', 'thread/r
 export const approvalMethods = new Set(['item/commandExecution/requestApproval',
   'item/fileChange/requestApproval', 'item/tool/requestUserInput']);
 
+function settingsMetadata(settings) {
+  const metadata = {};
+  for (const field of ['model', 'effort']) {
+    if (Object.hasOwn(settings, field)) metadata[field] = settings[field];
+  }
+  if (Object.hasOwn(settings, 'collaborationMode')) {
+    const mode = settings.collaborationMode;
+    metadata.collaborationMode = mode == null ? null : {};
+    if (mode && Object.hasOwn(mode, 'mode')) metadata.collaborationMode.mode = mode.mode;
+    if (mode?.settings && typeof mode.settings === 'object') {
+      metadata.collaborationMode.settings = {};
+      for (const field of ['model', 'reasoning_effort']) {
+        if (Object.hasOwn(mode.settings, field)) metadata.collaborationMode.settings[field] = mode.settings[field];
+      }
+    }
+  }
+  return metadata;
+}
+
 // Exactly one upstream connection. Desktop IDs never escape into Web request IDs.
 export class Broker extends EventEmitter {
   constructor(send, desktop = () => {}, { ownedThreads = null, saveOwnedThread = () => {} } = {}) {
@@ -21,6 +40,7 @@ export class Broker extends EventEmitter {
     this.active = new Map();
     this.starting = new Set();
     this.threadStatus = new Map();
+    this.threadSettings = new Map();
     this.statusCursors = new Map();
     this.archived = new Set();
     this.archiving = new Set();
@@ -59,6 +79,10 @@ export class Broker extends EventEmitter {
       const p = message.params;
       if (message.method === 'thread/status/changed') {
         this.threadStatus.set(p.threadId, p.status); this.statusCursors.set(p.threadId, this.cursor + 1);
+      }
+      if (message.method === 'thread/settings/updated' && typeof p?.threadId === 'string' &&
+          p.threadSettings && typeof p.threadSettings === 'object' && !Array.isArray(p.threadSettings)) {
+        this.threadSettings.set(p.threadId, settingsMetadata(p.threadSettings));
       }
       if (message.method === 'thread/archived') this.archived.add(p.threadId);
       if (message.method === 'thread/unarchived') this.archived.delete(p.threadId);
@@ -170,7 +194,23 @@ export class Broker extends EventEmitter {
     if (!request || !approvalMethods.has(request.method)) throw new Error('请求已处理或须在桌面处理');
     if (request.method !== 'item/tool/requestUserInput') {
       if (!['accept', 'decline', 'cancel'].includes(result?.decision)) throw new Error('无效审批结果');
-    } else if (!result?.answers || typeof result.answers !== 'object') throw new Error('缺少回答');
+    } else {
+      const answers = result?.answers;
+      const questions = request.params?.questions;
+      if (!answers || typeof answers !== 'object' || Array.isArray(answers)) throw new Error('缺少有效回答');
+      if (!Array.isArray(questions) || !questions.length ||
+          questions.some(question => typeof question?.id !== 'string' || !question.id)) {
+        throw new Error('问题格式无效，请在桌面处理');
+      }
+      const ids = new Set(questions.map(question => question.id));
+      if (ids.size !== questions.length || Object.keys(answers).length !== ids.size ||
+          Object.keys(answers).some(id => !ids.has(id))) throw new Error('回答的问题 ID 不匹配');
+      for (const id of ids) {
+        const values = Object.hasOwn(answers, id) ? answers[id]?.answers : null;
+        if (!Array.isArray(values) || !values.length ||
+            values.some(value => typeof value !== 'string' || !value.trim())) throw new Error('请完整回答所有问题');
+      }
+    }
     this.approvals.delete(id);
     this.send({ id, result });
     this.record('bridge/approvalAnswered', { id });
@@ -179,10 +219,11 @@ export class Broker extends EventEmitter {
   snapshot(after = 0) {
     return {
       ready: this.ready && !this.closed, cursor: this.cursor,
-      capabilities: { paginatedHistory: true, taskCommands: true, taskArchive: true },
+      capabilities: { paginatedHistory: true, taskCommands: true, taskArchive: true, threadSettings: true },
       reset: after > this.cursor || (this.events.length > 0 && after < this.events[0].cursor - 1),
       events: this.events.filter(e => e.cursor > after),
       active: Object.fromEntries(this.active),
+      threadSettings: Object.fromEntries(this.threadSettings),
       approvals: [...this.approvals.values()].filter(r => approvalMethods.has(r.method)),
     };
   }

@@ -8,6 +8,7 @@ import { DeliveryState, deliveryLabel } from '../public/delivery-state.js';
 import { taskPreferences } from '../public/task-preferences.js';
 import { ApprovalState, approvalLabel, isAnswerable } from '../public/approval-state.js';
 import { formatBytes } from '../public/attachment-policy.js';
+import { PlanMode, modeLabel } from '../public/plan-mode.js';
 
 function composer(storage = { getItem() { return null; }, setItem() {} }, session = { removeItem() {}, getItem() { return null; }, setItem() {} }) {
   const elements = new Map();
@@ -50,7 +51,7 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     return elements.get(id);
   };
   const context = vm.createContext({
-    document: { getElementById: get, addEventListener() {}, createElement: tag => new Element(tag), createTextNode: text => Object.assign(new Element(), { textContent: text }), body: new Element('body') },
+    document: { documentElement: { style: { setProperty() {} } }, getElementById: get, addEventListener() {}, createElement: tag => new Element(tag), createTextNode: text => Object.assign(new Element(), { textContent: text }), body: new Element('body') },
     window: { addEventListener() {} },
     sessionStorage: session,
     Option: function(text, value) { const option = new Element('option'); option.textContent = text; option.value = value; return option; },
@@ -61,11 +62,14 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary,
     DeliveryState, deliveryLabel, devicePanel: () => {},
     ApprovalState, approvalLabel, isAnswerable,
+    PlanMode, modeLabel,
     formatBytes,
     taskPreferences: () => taskPreferences(storage),
     goalPanel: () => ({ open: async () => {}, event() {} }),
   });
   const source = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  get('plan-mode-menu').hidden = true;
+  vm.runInContext(readFileSync(new URL('../public/question-card.js', import.meta.url), 'utf8').replace(/^export /gm, ''), context);
   vm.runInContext(source.replace(/^import .*;\n/gm, '').split("window.addEventListener('pagehide'")[0], context);
   const run = code => vm.runInContext(code, context);
   run("connected = true; threadId = 'thread-1';");
@@ -80,6 +84,58 @@ test('an explicitly rejected attachment submission clears uncertainty without po
   assert.equal(run('uncertainSubmission'), false);
   assert.equal(run('delivery.pending'), null);
   assert.equal(run('calls.length'), 1);
+});
+
+test('opening an existing plan task reads mode even when the bridge has no settings events', async () => {
+  const { run, get } = composer();
+  run(`
+    threadModeReads = true;
+    command = async () => ({ thread: { id: 'existing-plan', model: 'desktop-model', reasoningEffort: 'high', turns: [] } });
+    api = async path => {
+      if (path === '/api/thread-mode?threadId=existing-plan') return { threadId: 'existing-plan', collaborationMode: { mode: 'plan' }, source: 'runtime' };
+      throw Error('Unexpected request: ' + path);
+    };
+  `);
+  await run("select('existing-plan')");
+  assert.equal(get('compose').dataset.collaborationMode, 'plan', 'initial selection must synchronize the existing plan mode without waiting for a settings change');
+});
+
+test('historical mode is labelled separately, unavailable mode stays compact, and a desktop event wins a late read', async () => {
+  const { run, get } = composer();
+  run(`threadModeReads = true;
+    command = async () => ({ thread: { id: 'existing-plan', turns: [] } });
+    api = async () => ({ threadId: 'existing-plan', source: 'last-turn', collaborationMode: { mode: 'plan' } });`);
+  await run("select('existing-plan')");
+  assert.equal(get('plan-mode-value').textContent, '计划');
+  assert.equal(get('plan-mode-label').textContent, '最近一轮');
+  assert.equal(get('compose').dataset.collaborationMode, 'unknown');
+  run("api = async () => ({ threadId: 'existing-plan', source: 'unavailable', collaborationMode: null });");
+  await run("syncThreadMode('existing-plan');"); run('updateControls()');
+  assert.equal(get('plan-mode-value').textContent, '选择模式');
+  assert.equal(get('plan-mode-label').textContent, '');
+  run("api = () => new Promise(resolve => { globalThis.resolveMode = resolve; }); globalThis.readingMode = syncThreadMode('existing-plan');");
+  run("planMode.observe('existing-plan', { mode: 'default' }); planMode.choose('existing-plan', 'plan'); resolveMode({ threadId: 'existing-plan', source: 'runtime', collaborationMode: { mode: 'plan' } });");
+  await run('readingMode'); run('updateControls()');
+  assert.equal(get('compose').dataset.collaborationMode, 'default');
+  assert.equal(get('plan-mode').value, 'plan');
+});
+
+test('mode disclosure opens in the page, chooses only the next mode, and closes on Escape or a busy state', () => {
+  const { run, get } = composer();
+  run('updateControls()');
+  get('plan-mode').click();
+  assert.equal(get('plan-mode-menu').hidden, false);
+  assert.equal(get('plan-mode').getAttribute('aria-expanded'), 'true');
+  get('plan-mode-plan').click();
+  assert.equal(run("planMode.choices.get('thread-1')"), 'plan');
+  assert.equal(get('plan-mode-menu').hidden, true);
+  assert.equal(get('compose').dataset.collaborationMode, 'unknown');
+  get('plan-mode').click();
+  get('plan-mode-menu').onkeydown({ key: 'Escape', preventDefault() {} });
+  assert.equal(get('plan-mode-menu').hidden, true);
+  get('plan-mode').click(); run('sending = true; updateControls()');
+  assert.equal(get('plan-mode-menu').hidden, true);
+  assert.equal(get('plan-mode-plan').disabled, true);
 });
 
 test('archive confirmation, failure, notification and restored selection preserve drafts and favorites', async () => {

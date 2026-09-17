@@ -146,7 +146,7 @@ test('HTTP security audit covers outcomes without passwords, cookies, task input
   await post('/api/commands', { key: 'audit-key-001', method: 'thread/name/set', params: { threadId: 'owned', name: secret } }, cookie);
   broker.receive({ id: sent[0].id, error: { code: -1, message: secret } });
   await post('/api/commands', { key: 'audit-key-001', method: 'thread/name/set', params: { threadId: 'owned', name: secret } }, cookie);
-  broker.receive({ id: secret, method: 'item/tool/requestUserInput', params: {} });
+  broker.receive({ id: secret, method: 'item/tool/requestUserInput', params: { questions: [{ id: 'q' }] } });
   assert.equal((await post('/api/answer', { id: secret, result: { answers: { q: { answers: [secret] } } } }, cookie)).status, 200);
   assert.equal((await post('/api/answer', { id: secret, result: { answers: secret } }, cookie)).status, 400);
   const audit = await (await post('/api/security-audit/list', {}, cookie)).json();

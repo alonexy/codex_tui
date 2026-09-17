@@ -10,6 +10,7 @@ import { attachmentStore } from './attachments.mjs';
 import { serviceConfig } from './service-config.mjs';
 import { join } from 'node:path';
 import { loginSource } from './login-source.mjs';
+import { threadModes } from './thread-mode.mjs';
 
 const readOnlyRpc = new Set(['thread/list', 'thread/read', 'thread/resume', 'thread/items/list', 'thread/turns/list', 'thread/goal/get']);
 
@@ -17,6 +18,8 @@ const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/approval-state.js', ['approval-state.js', 'text/javascript; charset=utf-8']],
+  ['/plan-mode.js', ['plan-mode.js', 'text/javascript; charset=utf-8']],
+  ['/question-card.js', ['question-card.js', 'text/javascript; charset=utf-8']],
   ['/composer-media.js', ['composer-media.js', 'text/javascript; charset=utf-8']],
   ['/attachment-policy.js', ['attachment-policy.js', 'text/javascript; charset=utf-8']],
   ['/history-pages.js', ['history-pages.js', 'text/javascript; charset=utf-8']],
@@ -44,7 +47,7 @@ async function body(req, limit = 65536) {
   return JSON.parse(Buffer.concat(chunks).toString());
 }
 
-export function createWebServer(broker, { password, origin, mode, now, allowLanHttp = false, additionalOrigins = [], allowHttpOrigins = [], trustedProxyAddresses = [], auditPath, audit = createAudit({ path: auditPath, now }), uploadDirectory = join(serviceConfig().state, 'uploads'), readModels = desktopModels }) {
+export function createWebServer(broker, { password, origin, mode, now, allowLanHttp = false, additionalOrigins = [], allowHttpOrigins = [], trustedProxyAddresses = [], auditPath, audit = createAudit({ path: auditPath, now }), uploadDirectory = join(serviceConfig().state, 'uploads'), readModels = desktopModels, modes = threadModes() }) {
   const auth = createAuth(password, origin, now, { allowLanHttp, additionalOrigins, allowHttpOrigins });
   const source = loginSource(trustedProxyAddresses);
   const allowedOrigins = new Set([origin, ...additionalOrigins]);
@@ -113,12 +116,19 @@ export function createWebServer(broker, { password, origin, mode, now, allowLanH
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/state') {
-        return json(200, { ...await broker.snapshot(Number(url.searchParams.get('after')) || 0), ...(mode ? { mode } : {}) });
+        const state = await broker.snapshot(Number(url.searchParams.get('after')) || 0);
+        return json(200, { ...state, capabilities: { ...state.capabilities, threadMode: true }, ...(mode ? { mode } : {}) });
       }
       if (req.method === 'GET' && url.pathname === '/api/projects') return json(200, await desktopProjects());
       if (req.method === 'GET' && url.pathname === '/api/models') {
         try { return json(200, await readModels()); }
         catch { return json(503, { error: '模型目录暂不可用，请在桌面完成模型同步后重试。' }); }
+      }
+      if (req.method === 'GET' && url.pathname === '/api/thread-mode') {
+        const threadId = url.searchParams.get('threadId');
+        if (!threadId || url.searchParams.has('path')) return json(400, { error: '请先打开会话以同步模式' });
+        const result = await modes.read(threadId, await broker.snapshot(Number.MAX_SAFE_INTEGER));
+        return result ? json(200, result) : json(404, { error: '请先打开会话以同步模式' });
       }
       if (req.method === 'GET' && url.pathname.startsWith('/api/images/')) {
         const image = await images.read(url.pathname.slice('/api/images/'.length));
@@ -135,6 +145,7 @@ export function createWebServer(broker, { password, origin, mode, now, allowLanH
       }
       if (req.method === 'GET' && url.pathname.startsWith('/api/commands/')) {
         const command = await broker.getCommand(url.pathname.slice('/api/commands/'.length));
+        if (command?.status === 'completed' && ['thread/read', 'thread/resume', 'thread/start'].includes(command.method)) modes.register(command.result);
         return json(command ? 200 : 404, command ? { ...command, media: images.register(command.result), files: await attachments.register(command.result) } : { error: '没有此提交记录；请核对任务历史，勿盲目重发' });
       }
       if (req.method === 'POST') {

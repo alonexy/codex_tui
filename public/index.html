@@ -20,9 +20,16 @@
       <details id="conversation" open><summary>对话记录</summary><button id="older-history" type="button" class="secondary" hidden>加载更早消息</button><div id="history">选择任务后查看对话。</div></details>
       <section id="live-output" hidden><pre id="events"></pre></section>
       <div id="turn-loading" role="status" hidden><span class="loading-dot" aria-hidden="true"></span><span id="turn-loading-text">正在回复…</span></div>
+      <div id="interaction-dock">
+      <section id="questions" aria-label="待回答问题" hidden></section>
       <form id="compose">
         <div id="approval-reminder" hidden><span id="approval-reminder-text" role="status" aria-live="polite"></span><button id="open-current-approval" type="button">去处理</button></div>
         <div id="slash-menu" role="region" aria-label="命令菜单" hidden></div>
+        <div class="composer-mode-bar">
+          <div class="plan-mode-control"><span id="plan-mode-title" class="sr-only">模式</span><button id="plan-mode-clear" type="button" aria-label="取消计划模式" title="取消计划模式" hidden><span aria-hidden="true">×</span></button><button id="plan-mode" type="button" aria-describedby="plan-mode-label" aria-controls="plan-mode-menu" aria-expanded="false"><span id="plan-mode-value">选择模式</span><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" aria-hidden="true"><path d="m3 4.5 3 3 3-3"/></svg></button></div>
+          <p id="plan-mode-label" class="muted small" role="status"></p>
+        </div>
+        <div id="plan-mode-menu" role="group" aria-label="下轮模式" hidden><button id="plan-mode-default" type="button" class="secondary" aria-pressed="false">执行</button><button id="plan-mode-plan" type="button" class="secondary" aria-pressed="false">计划</button></div>
         <div class="composer-box">
         <div id="quick-menu" role="group" aria-labelledby="quick-title" hidden>
           <div class="quick-heading"><strong id="quick-title">快捷指令</strong><span>点击立即发送</span></div>
@@ -54,6 +61,7 @@
         <p id="error" class="error" role="alert"></p>
         <div id="recovery-actions" hidden><button id="check-receipt" class="secondary" type="button">查询发送结果</button><button id="reconcile" class="secondary" type="button" hidden>已核对历史，清除未知提交记录</button></div>
       </form>
+      </div>
     </section>
     <p id="connection-error" class="error" role="alert"></p>
     <dialog id="task-dialog" aria-labelledby="task-title">

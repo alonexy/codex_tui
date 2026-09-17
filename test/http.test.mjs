@@ -20,6 +20,7 @@ test('HTTP authentication, origin checks, receipts and reconnect state', async t
   assert.equal((await fetch(`${base}/api/state`)).status, 401);
   assert.equal((await fetch(`${base}/app.js`)).status, 401);
   assert.equal((await fetch(`${base}/approval-state.js`)).status, 401);
+  for (const module of ['plan-mode.js', 'question-card.js']) assert.equal((await fetch(`${base}/${module}`)).status, 401);
   assert.equal((await fetch(`${base}/index.html`)).status, 401);
   assert.equal((await fetch(`${base}/api/state`, { headers: { Authorization: `Bearer ${password}` } })).status, 401);
   assert.equal((await fetch(`${base}/api/state`, { headers: { ...headers, Origin: 'https://other.example' } })).status, 403);
@@ -60,6 +61,11 @@ test('HTTP authentication, origin checks, receipts and reconnect state', async t
   headers.Cookie = cookie.split(';')[0];
   assert.match(await (await fetch(base, { headers })).text(), /id="workspace"/);
   assert.equal((await fetch(`${base}/app.js`, { headers })).status, 200);
+  for (const module of ['plan-mode.js', 'question-card.js']) {
+    const response = await fetch(`${base}/${module}`, { headers });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type'), /text\/javascript/);
+  }
   const approvalModule = await fetch(`${base}/approval-state.js`, { headers });
   assert.equal(approvalModule.status, 200);
   assert.match(approvalModule.headers.get('content-type'), /text\/javascript/);
@@ -157,4 +163,38 @@ test('model catalog is authenticated, filtered, rereadable and has safe failure 
   assert.doesNotMatch(JSON.stringify(catalog), /secret|instructions|hidden/);
   await writeFile(path, JSON.stringify({ fetched_at: new Date().toISOString(), models: [] }));
   assert.deepEqual((await (await getModels()).json()).models, []);
+});
+
+test('mode lookup on an old bridge requires authentication and a native registered task, and filters transcript contents', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'http-thread-mode-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'rollout.jsonl');
+  await writeFile(path, JSON.stringify({ type: 'turn_context', payload: { turn_id: 'running-turn', collaboration_mode: { mode: 'plan', settings: { developer_instructions: 'private instructions' } } } }) + '\n');
+  const origin = 'http://127.0.0.1:8787', password = 'test-password-not-production';
+  const broker = new Broker(() => {});
+  // Reproduce the old resident bridge: no threadSettings capability or settings events.
+  const snapshot = broker.snapshot.bind(broker), cursors = [];
+  broker.snapshot = after => { cursors.push(after); const state = snapshot(after); delete state.threadSettings; delete state.capabilities.threadSettings; return state; };
+  broker.commands.set('native-read', { method: 'thread/read', status: 'completed', result: { thread: { id: 'allowed', path } } });
+  const server = createWebServer(broker, { password, origin });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  assert.equal((await fetch(`${base}/api/thread-mode?threadId=allowed`)).status, 401);
+  const headers = { Origin: origin, 'Content-Type': 'application/json' };
+  const login = await fetch(`${base}/api/login`, { method: 'POST', headers, body: JSON.stringify({ password }) });
+  headers.Cookie = login.headers.get('set-cookie').split(';')[0];
+  const lookup = query => fetch(`${base}/api/thread-mode?${query}`, { headers });
+  assert.equal((await lookup('threadId=allowed')).status, 404);
+  assert.equal((await lookup(`threadId=allowed&path=${encodeURIComponent(path)}`)).status, 400);
+  assert.equal((await fetch(`${base}/api/commands/native-read`, { headers })).status, 200);
+  const history = await (await lookup('threadId=allowed')).json();
+  assert.deepEqual(history, { threadId: 'allowed', collaborationMode: { mode: 'plan' }, turnId: 'running-turn', source: 'last-turn' });
+  assert.doesNotMatch(JSON.stringify(history), /private|instructions|rollout/);
+  assert.equal(cursors.at(-1), Number.MAX_SAFE_INTEGER);
+  broker.active.set('allowed', 'running-turn');
+  assert.equal((await (await lookup('threadId=allowed')).json()).source, 'current-turn');
+  assert.equal((await lookup('threadId=other')).status, 404);
+  const state = await (await fetch(`${base}/api/state`, { headers })).json();
+  assert.equal(state.capabilities.threadMode, true);
 });

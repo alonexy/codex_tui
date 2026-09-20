@@ -10,10 +10,27 @@ export function questionAnswers(questions, drafts) {
 }
 
 // The card owns its in-memory draft until the server removes this request.
-export function questionCard(questions, submit) {
+export function questionCard(questions, submit, saved, autoCollapseMs = 0) {
   const form = document.createElement('form'); form.className = 'question-form'; form.noValidate = true;
-  const drafts = new Map(questions.map(question => [question.id, { choice: '', text: '', custom: question.isSecret || !question.options?.length }]));
-  let current = 0, locked = false, collapsed = false;
+  const drafts = new Map(questions.map(question => [question.id, saved?.drafts.get(question.id) ?? { choice: '', text: '', custom: question.isSecret || !question.options?.length }]));
+  let current = Math.max(0, questions.findIndex(question => question.id === saved?.currentId)), locked = false, collapsed = saved?.collapsed ?? false;
+  let resolved = new Set();
+  let active = false, idleTimer = null;
+  const canCollapse = () => autoCollapseMs && active && form.isConnected && !locked && !collapsed && !form.querySelector('input:focus');
+  function resetIdle() {
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = null;
+    if (!canCollapse()) return;
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      if (!canCollapse()) return;
+      const restoreFocus = body.contains(document.activeElement);
+      collapsed = true; refresh();
+      if (restoreFocus) collapse.focus({ preventScroll: true });
+    }, autoCollapseMs);
+  }
+  const remaining = () => questions.filter(question => !resolved.has(question.id));
+  const visibleIndices = () => questions.flatMap((question, index) => resolved.has(question.id) ? [] : [index]);
   const top = document.createElement('div'); top.className = 'question-top';
   const progress = document.createElement('span'); progress.className = 'muted small'; progress.setAttribute('role', 'status');
   const collapse = document.createElement('button'); collapse.type = 'button'; collapse.className = 'secondary question-collapse'; collapse.textContent = '收起';
@@ -45,11 +62,12 @@ export function questionCard(questions, submit) {
     custom.onclick = () => { draft.custom = true; refresh(); input.focus({ preventScroll: true }); };
     const label = document.createElement('label'); label.textContent = question.isSecret ? '填写私密回答' : '你的回答';
     const input = document.createElement('input'); input.type = question.isSecret ? 'password' : 'text'; input.autocomplete = 'off'; input.spellcheck = !question.isSecret;
+    input.dataset.questionId = question.id; input.value = draft.text;
     input.setAttribute('aria-label', `${question.header || `问题 ${index + 1}`}：${question.isSecret ? '私密回答' : '自行填写'}`);
     input.oninput = () => { draft.text = input.value; refresh(); };
     label.append(input); panel.append(custom, label);
     panel.update = () => {
-      panel.hidden = current !== index;
+      panel.hidden = current !== index || resolved.has(question.id);
       for (const [button, value] of options) button.setAttribute('aria-pressed', String(!draft.custom && draft.choice === value));
       custom.setAttribute('aria-pressed', String(draft.custom)); label.hidden = !draft.custom;
     };
@@ -59,32 +77,47 @@ export function questionCard(questions, submit) {
   const previous = document.createElement('button'); previous.type = 'button'; previous.className = 'secondary'; previous.textContent = '上一题';
   const next = document.createElement('button'); next.type = 'button'; next.className = 'secondary'; next.textContent = '下一题';
   const send = document.createElement('button'); send.type = 'submit'; send.textContent = '发送全部回答'; send.className = 'question-send';
-  previous.onclick = () => { current--; refresh(); };
-  next.onclick = () => { current++; refresh(); };
+  previous.onclick = () => { const indices = visibleIndices(); current = indices[indices.indexOf(current) - 1] ?? current; refresh(); };
+  next.onclick = () => { const indices = visibleIndices(); current = indices[indices.indexOf(current) + 1] ?? current; refresh(); };
   collapse.onclick = () => { collapsed = !collapsed; refresh(); };
   navigation.append(previous, next);
   const footer = document.createElement('div'); footer.className = 'question-footer'; footer.append(navigation, send);
   scroll.append(...panels); body.append(tabs, scroll, footer); form.append(top, body);
+  if (autoCollapseMs) {
+    for (const event of ['pointerdown', 'pointerup', 'click', 'keydown', 'input', 'focusin', 'wheel', 'touchmove']) {
+      form.addEventListener(event, resetIdle);
+    }
+    form.addEventListener('focusout', event => { if (event.target.tagName === 'INPUT') queueMicrotask(resetIdle); });
+  }
   function refresh() {
     for (const control of form.querySelectorAll('button, input')) control.disabled = locked;
-    const answered = questions.filter(question => questionAnswers([question], drafts)).length;
-    progress.textContent = collapsed ? `待回答 · 共 ${questions.length} 题` : `${current + 1} / ${questions.length} · 已回答 ${answered} 题`;
+    const indices = visibleIndices(), available = remaining();
+    if (!indices.includes(current)) current = indices[0] ?? 0;
+    const answered = available.filter(question => questionAnswers([question], drafts)).length;
+    progress.textContent = collapsed ? `待回答 · 共 ${available.length} 题` : `${Math.max(0, indices.indexOf(current) + 1)} / ${available.length} · 已回答 ${answered} 题`;
     form.classList.toggle('collapsed', collapsed);
     body.hidden = collapsed; collapse.textContent = collapsed ? '展开回答' : '收起'; collapse.setAttribute('aria-expanded', String(!collapsed));
     tabButtons.forEach((tab, index) => {
+      tab.hidden = resolved.has(questions[index].id);
       tab.textContent = `${index + 1}${questionAnswers([questions[index]], drafts) ? ' ✓' : ''}`;
       tab.setAttribute('aria-label', `问题 ${index + 1}：${questions[index].header || '回答'}${questionAnswers([questions[index]], drafts) ? '，已回答' : ''}`);
       tab.setAttribute('aria-pressed', String(current === index));
     });
     panels.forEach(panel => panel.update());
-    previous.disabled = locked || current === 0; next.disabled = locked || current >= questions.length - 1;
-    send.disabled = locked || !questionAnswers(questions, drafts);
+    previous.disabled = locked || indices.indexOf(current) <= 0; next.disabled = locked || indices.indexOf(current) >= indices.length - 1;
+    send.disabled = locked || !questionAnswers(available, drafts);
   }
   form.onsubmit = event => {
     event.preventDefault();
-    const result = questionAnswers(questions, drafts);
+    const result = questionAnswers(remaining(), drafts);
     if (!locked && result) submit(result);
   };
   refresh();
-  return { form, setLocked(value) { locked = value; refresh(); } };
+  return {
+    form,
+    capture() { return { drafts, currentId: questions[current]?.id, collapsed }; },
+    setActive(value) { if (active !== value) { active = value; resetIdle(); } },
+    setLocked(value) { const changed = locked !== value; locked = value; refresh(); if (changed) resetIdle(); },
+    setResolved(ids) { resolved = new Set(ids); refresh(); },
+  };
 }

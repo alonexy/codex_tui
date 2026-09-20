@@ -9,6 +9,7 @@ import { taskPreferences } from '../public/task-preferences.js';
 import { ApprovalState, approvalLabel, isAnswerable } from '../public/approval-state.js';
 import { formatBytes } from '../public/attachment-policy.js';
 import { PlanMode, modeLabel } from '../public/plan-mode.js';
+import { questionsForItem, replyForItem, parseQuestionReply, serializeQuestionReply, collectAsyncQuestions } from '../public/async-questions.js';
 
 function composer(storage = { getItem() { return null; }, setItem() {} }, session = { removeItem() {}, getItem() { return null; }, setItem() {} }) {
   const elements = new Map();
@@ -63,6 +64,7 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     DeliveryState, deliveryLabel, devicePanel: () => {},
     ApprovalState, approvalLabel, isAnswerable,
     PlanMode, modeLabel,
+    questionsForItem, replyForItem, parseQuestionReply, serializeQuestionReply, collectAsyncQuestions,
     formatBytes,
     taskPreferences: () => taskPreferences(storage),
     goalPanel: () => ({ open: async () => {}, event() {} }),
@@ -75,6 +77,98 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
   run("connected = true; threadId = 'thread-1';");
   return { get, run };
 }
+
+test('stale steering records preserve echo identities and render an accepted answer once', () => {
+  for (const field of ['serverUserMessageId', 'clientUserMessageId']) {
+    const { run, get } = composer();
+    run(`globalThis.input = [{ type: 'text', text: serializeQuestionReply([{ id: JSON.stringify(['request_user_input_async', 'q', 0]), question: '问题' }], { answers: { [JSON.stringify(['request_user_input_async', 'q', 0])]: { answers: ['回答'] } } }) }];
+      globalThis.accepted = { id: 'steering', type: 'steeringUserMessage', status: 'accepted', input, ${field}: 'echo' };
+      globalThis.stale = { ...accepted, status: 'pending', ${field}: null };
+      globalThis.echo = { id: '${field === 'serverUserMessageId' ? 'echo' : 'user'}', clientId: 'echo', type: 'userMessage', content: input };
+      timeline.event({ method: 'item/completed', params: { threadId, turnId: 'turn', item: accepted } });
+      timeline.event({ method: 'item/started', params: { threadId, turnId: 'turn', item: stale } });`);
+    for (let read = 0; read < 2; read++) {
+      run(`renderHistory(timeline.snapshot(threadId, { id: threadId, turns: [{ id: 'turn', items: [{ ...stale }, echo] }] }));`);
+      assert.equal(get('history').querySelectorAll('.question-answer').length, 1, `${field}: stale snapshots must not duplicate the answer`);
+      assert.equal(run(`timeline.thread(threadId).turns[0].items[0].${field}`), 'echo');
+    }
+  }
+});
+
+test('normal sending hides recovery actions until an unresolved submission actually needs recovery', () => {
+  const { run, get } = composer();
+  run(`uncertainSubmission = true; sending = true; delivery.pending = { method: 'turn/start' }; updateControls();`);
+  assert.equal(get('recovery-actions').hidden, true);
+  assert.equal(get('reconcile').hidden, true);
+  assert.equal(get('delivery-status').textContent, '发送中…');
+  assert.equal(get('send').disabled, true);
+  run(`sending = false; updateControls();`);
+  assert.equal(get('recovery-actions').hidden, false);
+  assert.equal(get('reconcile').hidden, false);
+  assert.match(get('delivery-status').textContent, /结果待确认/);
+  assert.equal(get('send').disabled, true);
+});
+
+test('async replies preserve normal drafts and attachments and use explicit receipt identities', async () => {
+  const { run, get } = composer();
+  get('message').value = '普通草稿';
+  run(`globalThis.calls = []; poll = async () => {};
+    composerAttachments.input = async () => { throw Error('must not upload ordinary attachments'); };
+    composerAttachments.clear = () => { throw Error('must not clear ordinary attachments'); };
+    command = async (...args) => { calls.push(args); };
+    active[threadId] = 'active-turn';`);
+  await run(`send(true, 'async reply', ['question-id'])`);
+  assert.equal(get('message').value, '普通草稿');
+  assert.deepEqual(JSON.parse(run('JSON.stringify(calls[0])')), ['turn/steer', { threadId: 'thread-1', input: [{ type: 'text', text: 'async reply' }], expectedTurnId: 'active-turn' }, null, ['question-id']]);
+  run(`active = {}; planMode.choose(threadId, 'plan'); defaultModels.set(threadId, 'mock-model');`);
+  await run(`send(false, 'idle async reply', ['second-id'])`);
+  assert.equal(run('calls[1][0]'), 'turn/start');
+  assert.equal(run('calls[1][1].collaborationMode.mode'), 'plan');
+});
+
+test('async history keeps repeated answers, hides only identified echoes and leaves malformed content visible', () => {
+  const { run, get } = composer();
+  run(`globalThis.qid = JSON.stringify(['request_user_input_async', 'q', 0]);
+    globalThis.reply = answer => '<send_user_message_question_reply>' + JSON.stringify({ questionItemId: qid, question: '同一个问题', answer }) + '</send_user_message_question_reply>';
+    renderHistory({ id: threadId, turns: [{ id: 't', items: [
+      { id: 'q', type: 'agentMessage', questions: [{ title: '同一个问题', options: ['A','B'] }] },
+      ...['A','B','A'].map((answer,index) => ({ id: 'u'+index, type: 'userMessage', content: [{type:'text',text:reply(answer)}] })),
+      { id: 'steer', type: 'steeringUserMessage', status:'accepted', serverUserMessageId:'u2', input:[{type:'text',text:reply('A')}] },
+      { id: 'steer-client', type: 'steeringUserMessage', status:'accepted', clientUserMessageId:'client-4', input:[{type:'text',text:reply('C')}] },
+      { id: 'u4', clientId:'client-4', type:'userMessage', content:[{type:'text',text:reply('C')}] },
+      { id: 'bad', type: 'userMessage', content: [{type:'text',text:'<send_user_message_question_reply>broken'}] }
+    ] }] });`);
+  assert.equal(get('history').querySelectorAll('.question-answer').length, 4);
+  assert.match(get('history').textContent, /broken/);
+  assert.equal(get('questions').children.length, 0);
+});
+
+test('desktop partial answers keep remaining card drafts; extension adds new questions and task switching hides old cards', async () => {
+  const { run, get } = composer();
+  run(`globalThis.source = { id:'q',type:'agentMessage',questions:[{title:'first'},{title:'second'}] };
+    globalThis.thread = { id:threadId,turns:[{id:'t',items:[source]}] }; renderHistory(thread);
+    globalThis.card = asyncQuestionCards[0];
+    globalThis.input = card.querySelectorAll('input')[1]; input.value='keep draft'; input.oninput();
+    globalThis.answer = {id:'a',type:'steeringUserMessage',status:'accepted',input:[{type:'text',text:serializeQuestionReply([questionsForItem(source)[0]],{answers:{[questionsForItem(source)[0].id]:{answers:['done']}}})}]};
+    thread.turns[0].items.push(answer); renderHistory(thread);`);
+  assert.equal(run('asyncQuestionCards[0] === card'), true);
+  assert.equal(run("card.querySelectorAll('input')[1].value"), 'keep draft');
+  run(`source.questions.push({title:'third'}); renderHistory(thread);`);
+  assert.equal(run('asyncQuestionCards[0].questions.length'), 3);
+  assert.equal(run("asyncQuestionCards[0].querySelectorAll('input')[1].value"), 'keep draft');
+  run(`command = async () => { throw Error('load failure'); };`);
+  await assert.rejects(run("select('other')"), /load failure/);
+  assert.equal(get('questions').children.length, 0);
+});
+
+test('desktop answers still clear the visible card if metadata storage fails', () => {
+  const { run, get } = composer(undefined, {getItem(){return null;},removeItem(){},setItem(){throw Error('full');}});
+  run(`globalThis.q = {id:'q',type:'agentMessage',questions:[{title:'question'}]};
+    renderHistory({id:threadId,turns:[{id:'t',items:[q]}]});
+    renderHistory({id:threadId,turns:[{id:'t',items:[q,{id:'a',type:'userMessage',content:[{type:'text',text:serializeQuestionReply(questionsForItem(q),{answers:{[questionsForItem(q)[0].id]:{answers:['yes']}}})}]}]}]});`);
+  assert.equal(get('questions').children.length, 0);
+  assert.match(get('history').textContent, /yes/);
+});
 
 test('an explicitly rejected attachment submission clears uncertainty without polling or replay', async () => {
   const { run } = composer();

@@ -7,6 +7,22 @@ const terminal = status => ['completed', 'failed', 'interrupted'].includes(statu
 const metadataFor = turn => Object.fromEntries(['status', 'error', 'startedAt', 'completedAt', 'durationMs']
   .filter(key => turn[key] !== undefined).map(key => [key, turn[key]]));
 
+function preserveQuestionMetadata(previous, item) {
+  if (!previous || previous.type !== item.type) return item;
+  const result = { ...item };
+  if (item.type === 'agentMessage') for (const field of ['questions', 'delivery']) {
+    if (!Object.hasOwn(item, field) && Object.hasOwn(previous, field)) result[field] = previous[field];
+  }
+  if (item.type === 'steeringUserMessage' && previous.status === 'accepted') {
+    result.status = 'accepted';
+    // Older snapshots may not yet contain the identities used to merge the echo.
+    for (const field of ['serverUserMessageId', 'clientUserMessageId']) {
+      if (!result[field] && previous[field]) result[field] = previous[field];
+    }
+  }
+  return result;
+}
+
 // Item pages may overlap, and started/completed notifications share an ID.
 export function turnItems(turn) {
   const items = new Map();
@@ -15,7 +31,7 @@ export function turnItems(turn) {
 }
 
 export function isProcessItem(item) {
-  if (item.type === 'userMessage') return false;
+  if (item.type === 'userMessage' || item.type === 'steeringUserMessage') return false;
   if (item.type === 'agentMessage') return item.phase === 'commentary' && !item.questions?.length;
   return true;
 }
@@ -82,6 +98,9 @@ export class Timeline {
   }
   snapshot(id, thread) {
     this.metadata(id, thread.turns ?? []);
+    const previous = this.histories.get(id);
+    thread = { ...thread, turns: (thread.turns ?? []).map(turn => ({ ...turn, items: (turn.items ?? []).map(item =>
+      preserveQuestionMetadata(previous?.turns?.find(old => old.id === turn.id)?.items?.find(old => old.id === item.id), item)) })) };
     this.histories.set(id, thread);
     return this.thread(id, true);
   }
@@ -97,7 +116,9 @@ export class Timeline {
     let live = this.live.get(p.threadId);
     if (!live) { live = new Map(); this.live.set(p.threadId, live); }
     if (['item/started', 'item/completed'].includes(event.method) && p.item?.id) {
-      live.set(keyFor(p.turnId, p.item.id), { turnId: p.turnId ?? '', item: p.item }); return;
+      const key = keyFor(p.turnId, p.item.id);
+      const historical = this.histories.get(p.threadId)?.turns?.find(turn => turn.id === p.turnId)?.items?.find(item => item.id === p.item.id);
+      live.set(key, { turnId: p.turnId ?? '', item: preserveQuestionMetadata(live.get(key)?.item ?? historical, p.item) }); return;
     }
     if (!p.itemId || typeof p.delta !== 'string') return;
     const type = event.method === 'item/agentMessage/delta' ? 'agentMessage'
@@ -121,7 +142,9 @@ export class Timeline {
       const updated = live.get(match)?.item;
       live.delete(match);
       if (consume) this.live.get(id)?.delete(match);
-      return consume ? item : updated ?? item;
+      const merged = consume ? preserveQuestionMetadata(updated, item) : updated ?? item;
+      if (consume && updated) Object.assign(item, merged);
+      return merged;
     }) }));
     for (const { turnId, item } of live.values()) {
       let turn = turns.find(turn => (turn.id ?? '') === turnId);

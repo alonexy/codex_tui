@@ -68,19 +68,19 @@ export function createPlanMock() {
         const { method, params, key } = body;
         let result = {}, status = 'completed';
         if (method === 'thread/list') result = { data: [...tasks.values()], nextCursor: null };
-        else if (method === 'thread/read' || method === 'thread/resume') result = { thread: tasks.get(params.threadId), model: tasks.get(params.threadId)?.model, reasoningEffort: tasks.get(params.threadId)?.reasoningEffort, initialTurnsPage: { data: [] } };
+        else if (method === 'thread/read' || method === 'thread/resume') result = { thread: tasks.get(params.threadId), model: tasks.get(params.threadId)?.model, reasoningEffort: tasks.get(params.threadId)?.reasoningEffort, initialTurnsPage: { data: [...(tasks.get(params.threadId)?.turns ?? [])].reverse() } };
         else if (method === 'turn/start') {
           if (rejectTurn) { status = 'failed'; rejectTurn = false; }
           else {
             state.active[params.threadId] = 'mock-turn'; result = { turn: { id: 'mock-turn' } };
             if (params.collaborationMode) settings(params.threadId, params.collaborationMode.mode, params.collaborationMode.settings.model, params.collaborationMode.settings.reasoning_effort);
           }
-        } else if (method === 'turn/steer') result = { turnId: 'mock-turn' };
+        } else if (method === 'turn/steer') { result = { turnId: 'mock-turn' }; if (rejectTurn) { status = 'failed'; rejectTurn = false; } }
         else if (method === 'turn/interrupt') state.active = {};
         else if (method === 'thread/name/set') tasks.get(params.threadId).name = params.name;
         else return json({ error: `Unsupported mock method: ${method}`, submission: 'rejected' }, 400);
         const record = { status, result, ...(status === 'failed' ? { error: { message: '模拟发送失败' } } : {}) };
-        if (method === 'turn/start' && holdReceipt) { held = { key, record }; receipts.set(key, { status: 'pending' }); }
+        if (['turn/start', 'turn/steer'].includes(method) && holdReceipt) { held = { key, record }; receipts.set(key, { status: 'pending' }); }
         else receipts.set(key, record);
         return json({ status: 'pending' });
       }
@@ -98,7 +98,7 @@ export function createPlanMock() {
       response.writeHead(200, { 'content-type': file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html', 'cache-control': 'no-store' }); response.end(content);
     } catch (error) { json({ error: error.message }, 500); }
   });
-  return { server, state, calls, answers, modeRead };
+  return { server, state, calls, answers, modeRead, tasks, event };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

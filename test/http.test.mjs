@@ -20,7 +20,7 @@ test('HTTP authentication, origin checks, receipts and reconnect state', async t
   assert.equal((await fetch(`${base}/api/state`)).status, 401);
   assert.equal((await fetch(`${base}/app.js`)).status, 401);
   assert.equal((await fetch(`${base}/approval-state.js`)).status, 401);
-  for (const module of ['plan-mode.js', 'question-card.js']) assert.equal((await fetch(`${base}/${module}`)).status, 401);
+  for (const module of ['plan-mode.js', 'question-card.js', 'async-questions.js']) assert.equal((await fetch(`${base}/${module}`)).status, 401);
   assert.equal((await fetch(`${base}/index.html`)).status, 401);
   assert.equal((await fetch(`${base}/api/state`, { headers: { Authorization: `Bearer ${password}` } })).status, 401);
   assert.equal((await fetch(`${base}/api/state`, { headers: { ...headers, Origin: 'https://other.example' } })).status, 403);
@@ -61,7 +61,7 @@ test('HTTP authentication, origin checks, receipts and reconnect state', async t
   headers.Cookie = cookie.split(';')[0];
   assert.match(await (await fetch(base, { headers })).text(), /id="workspace"/);
   assert.equal((await fetch(`${base}/app.js`, { headers })).status, 200);
-  for (const module of ['plan-mode.js', 'question-card.js']) {
+  for (const module of ['plan-mode.js', 'question-card.js', 'async-questions.js']) {
     const response = await fetch(`${base}/${module}`, { headers });
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /text\/javascript/);

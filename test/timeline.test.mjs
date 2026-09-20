@@ -99,3 +99,48 @@ test('an empty failed turn has a visible status and duplicate item IDs are recon
   timeline.snapshot('a', { id: 'a', turns: [{ id: 'turn', items }] });
   assert.equal(timeline.thread('a').turns[0].items.length, 2);
 });
+
+test('live async question metadata survives snapshots that omit it and later thread reads', () => {
+  const timeline = new Timeline();
+  const questions = [{ title: '继续方式', options: ['自动', '手动'] }];
+  const item = { id: 'question', type: 'agentMessage', phase: 'commentary', text: '请选择', questions, delivery: 'queued' };
+  const snapshotItem = { id: item.id, type: item.type, phase: item.phase, text: '请选择方式' };
+  const snapshot = { id: 'a', turns: [{ id: 'turn', items: [snapshotItem] }] };
+  timeline.event({ method: 'item/completed', params: { threadId: 'a', turnId: 'turn', item } });
+  timeline.event({ method: 'item/started', params: { threadId: 'a', turnId: 'turn', item: snapshotItem } });
+  assert.deepEqual(timeline.thread('a').turns[0].items[0].questions, questions);
+  const merged = timeline.snapshot('a', structuredClone(snapshot)).turns[0].items[0];
+  assert.deepEqual(merged.questions, questions);
+  assert.equal(merged.delivery, 'queued');
+  assert.equal(merged.text, snapshotItem.text);
+  assert.equal(isProcessItem(merged), false);
+  for (let read = 0; read < 2; read++) {
+    const saved = timeline.thread('a').turns[0].items;
+    assert.equal(saved.length, 1);
+    assert.deepEqual(saved[0].questions, questions);
+    assert.equal(saved[0].delivery, 'queued');
+  }
+  timeline.snapshot('a', structuredClone(snapshot));
+  assert.deepEqual(timeline.thread('a').turns[0].items[0].questions, questions);
+  assert.equal(timeline.thread('b').turns.length, 0);
+});
+
+test('accepted steering cannot regress through pending events or stale snapshots', () => {
+  const timeline = new Timeline();
+  const item = { id: 'steering', type: 'steeringUserMessage', status: 'accepted', input: [{ type: 'text', text: '回答' }] };
+  const stale = { ...item, status: 'pending' };
+  const snapshot = { id: 'a', turns: [{ id: 'turn', items: [stale] }] };
+  timeline.event({ method: 'item/completed', params: { threadId: 'a', turnId: 'turn', item } });
+  timeline.event({ method: 'item/started', params: { threadId: 'a', turnId: 'turn', item: stale } });
+  assert.equal(timeline.thread('a').turns[0].items[0].status, 'accepted');
+  assert.equal(timeline.snapshot('a', structuredClone(snapshot)).turns[0].items[0].status, 'accepted');
+  assert.equal(timeline.thread('a').turns[0].items[0].status, 'accepted');
+  timeline.snapshot('a', structuredClone(snapshot));
+  assert.equal(timeline.thread('a').turns[0].items[0].status, 'accepted');
+  timeline.event({ method: 'item/started', params: { threadId: 'a', turnId: 'turn', item: stale } });
+  const items = timeline.thread('a').turns[0].items;
+  assert.equal(items.length, 1);
+  assert.equal(items[0].status, 'accepted');
+  assert.deepEqual(items[0].input, item.input);
+  assert.equal(isProcessItem(items[0]), false);
+});

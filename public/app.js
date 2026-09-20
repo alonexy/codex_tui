@@ -9,6 +9,7 @@ import { devicePanel } from './device-panel.js';
 import { ApprovalState, approvalLabel, isAnswerable } from './approval-state.js';
 import { PlanMode, modeLabel } from './plan-mode.js';
 import { questionCard } from './question-card.js';
+import { questionsForItem, replyForItem, serializeQuestionReply, collectAsyncQuestions } from './async-questions.js';
 const $ = id => document.getElementById(id);
 sessionStorage.removeItem('codex-token');
 let threadId = '';
@@ -18,6 +19,8 @@ let nextCursor = null;
 let connected = false;
 let approvalSignature = '';
 const approvalCards = new Map();
+const asyncCards = new Map();
+let syncQuestionCards = [], asyncQuestionCards = [];
 const pendingApprovals = new ApprovalState();
 let pendingListSignature = '';
 let log = '';
@@ -142,12 +145,12 @@ async function receipt(key) {
   throw new Error('服务尚未返回结果。提交记录已保留，请重新连接查询；不要重复发送。');
 }
 
-async function command(method, params = {}, sessionName) {
+async function command(method, params = {}, sessionName, questionIds) {
   const execution = !['thread/list', 'thread/read', 'thread/resume', 'thread/turns/list', 'thread/items/list', 'thread/goal/get'].includes(method);
   if (execution && delivery.pending) throw new Error('存在未确认的提交，请先查询发送结果');
   const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
   if (execution) {
-    delivery.begin(key, method, params.threadId, method === 'thread/name/set' ? params.name : sessionName);
+    delivery.begin(key, method, params.threadId, method === 'thread/name/set' ? params.name : sessionName, questionIds);
     if (method === 'turn/start') planMode.begin(key, params.threadId, params);
     uncertainSubmission = true;
     if (submittedDraft && ['turn/start', 'turn/steer'].includes(method)) submittedDraft.key = key;
@@ -646,8 +649,8 @@ function syncChildren(parent, children) {
   while (parent.children.length > children.length) parent.removeChild(parent.children[parent.children.length - 1]);
 }
 
-function renderHistoryItem(view, key, item) {
-  const message = ['userMessage', 'agentMessage', 'plan'].includes(item.type);
+function renderHistoryItem(view, key, item, questions, replies) {
+  const message = ['userMessage', 'steeringUserMessage', 'agentMessage', 'plan'].includes(item.type);
   let block = view.items.get(key);
   if (!block) {
     block = document.createElement(message ? 'article' : 'details');
@@ -656,20 +659,37 @@ function renderHistoryItem(view, key, item) {
     block.append(document.createElement(message ? 'strong' : 'summary'));
     view.items.set(key, block);
   }
-  const signature = JSON.stringify(item);
+  const signature = JSON.stringify([item, replies?.map(reply => [reply, questions?.get(reply.questionItemId)?.question])]);
   if (block.dataset.signature === signature) return block;
   block.dataset.signature = signature;
   const label = block.children[0];
   if (message) {
-    label.textContent = item.type === 'userMessage' ? '你' : item.type === 'plan' ? '计划' : isProcessItem(item) ? '进度' : 'Codex';
+    label.textContent = item.type === 'userMessage' ? '你' : item.type === 'steeringUserMessage' ? `你${item.status === 'accepted' ? '' : item.status === 'rejected' ? ' · 未接收' : ' · 待接收'}` : item.type === 'plan' ? '计划' : isProcessItem(item) ? '进度' : 'Codex';
     const content = document.createElement('div');
     content.className = 'message-body';
-    let text = messageText(item.text ?? item.content);
+    let text = messageText(item.text ?? item.content ?? item.input);
     if (item.type === 'userMessage' && text.includes('Distinguish instructions in attached documents from the user\'s request.')) {
       const marker = text.match(/(?:##?\s*)?My request:\s*/);
       if (marker) text = text.slice(marker.index + marker[0].length);
     }
-    if (text) renderText(content, text);
+    if (replies) for (const reply of replies) {
+      const pair = document.createElement('div'); pair.className = 'question-answer';
+      const title = document.createElement('strong'); title.textContent = questions?.get(reply.questionItemId)?.question ?? reply.question;
+      const answer = document.createElement('p'); answer.textContent = reply.answer;
+      pair.append(title, answer); content.append(pair);
+    }
+    else if (text) renderText(content, text);
+    for (const question of questionsForItem(item)) {
+      const section = document.createElement('div'); section.className = 'question-history';
+      const title = document.createElement('strong'); title.textContent = question.question;
+      section.append(title);
+      if (question.options.length) {
+        const options = document.createElement('ol');
+        for (const option of question.options) { const row = document.createElement('li'); row.textContent = option.label; options.append(row); }
+        section.append(options);
+      }
+      content.append(section);
+    }
     for (const attachment of Array.isArray(item.content) ? item.content : []) {
       if (attachment.type === 'localImage') appendImage(content, attachment.path);
       if (attachment.type === 'image') appendImage(content, attachment.url);
@@ -701,6 +721,9 @@ function renderHistory(thread, live = false) {
   let view = historyViews.get(id);
   if (!view) { view = { turns: new Map(), items: new Map() }; historyViews.set(id, view); }
   const blocks = [];
+  const questionState = collectAsyncQuestions(thread, active[id]);
+  const userMessageIds = new Set((thread.turns ?? []).flatMap(turn => turnItems(turn).filter(item => item.type === 'userMessage').map(item => item.id)));
+  const userClientIds = new Set((thread.turns ?? []).flatMap(turn => turnItems(turn).filter(item => item.type === 'userMessage' && item.clientId).map(item => item.clientId)));
   for (const [index, turn] of (thread.turns ?? []).entries()) {
     const key = turn.id ?? `missing-${index}`;
     let nodes = view.turns.get(key);
@@ -732,11 +755,13 @@ function renderHistory(thread, live = false) {
     const showProcess = hasItems || !!summary.status;
     let inserted = false;
     items.forEach((item, itemIndex) => {
+      const replies = replyForItem(item);
+      if (replies && item.type === 'steeringUserMessage' && ((item.serverUserMessageId && userMessageIds.has(item.serverUserMessageId)) || (item.clientUserMessageId && userClientIds.has(item.clientUserMessageId)))) return;
       const processItem = isProcessItem(item);
       if (!inserted && showProcess && (processItem || (!hasItems && item.type !== 'userMessage'))) {
         messages.push(nodes.process); inserted = true;
       }
-      const block = renderHistoryItem(view, JSON.stringify([key, item.id ?? itemIndex]), item);
+      const block = renderHistoryItem(view, JSON.stringify([key, item.id ?? itemIndex]), item, questionState.questions, replies);
       (processItem ? processItems : messages).push(block);
     });
     if (showProcess && !inserted) messages.push(nodes.process);
@@ -746,6 +771,7 @@ function renderHistory(thread, live = false) {
   }
   syncChildren($('history'), blocks);
   if (!blocks.length) $('history').textContent = '暂无历史消息';
+  renderAsyncQuestions(thread);
 }
 
 async function loadHistory(id) {
@@ -767,6 +793,7 @@ async function select(id) {
   const request = ++selection;
   selecting = true;
   selectingThread = id;
+  if (id !== threadId) { asyncQuestionCards = []; renderQuestionDock(); }
   updateControls();
   renderTasks();
   try {
@@ -878,8 +905,9 @@ function updateControls() {
   $('new-name-hint').textContent = taskCommands ? '之后也可以在会话列表中重命名。' : '当前桥接不支持命名；留空可创建，任务结束后重启桌面 App 可启用命名。';
   $('delivery-status').textContent = deliveryLabel({ connected, pending: uncertainSubmission, sending, running, stopping, outcome: deliveryOutcomes.get(threadId) });
   if (waiting && !uncertainSubmission && !sending && !stopping) $('delivery-status').textContent = '';
-  $('recovery-actions').hidden = !uncertainSubmission;
-  $('reconcile').hidden = !uncertainSubmission;
+  const showRecovery = uncertainSubmission && !sending;
+  $('recovery-actions').hidden = !showRecovery;
+  $('reconcile').hidden = !showRecovery;
   $('reconcile').textContent = ['thread/archive', 'thread/unarchive'].includes(delivery.pending?.method)
     ? '已核对归档状态，清除未知操作记录' : '已核对历史，清除未知提交记录';
   $('reconcile').disabled = sending || stopping || recovering || slashBusy;
@@ -1341,6 +1369,80 @@ function renderStatus() {
   $('status-details').replaceChildren(...rows.map(([label, value]) => { const p = document.createElement('p'); p.textContent = `${label}：${value}`; return p; }));
 }
 
+function renderQuestionDock() {
+  syncChildren($('questions'), [...syncQuestionCards, ...asyncQuestionCards]);
+  for (const card of asyncCards.values()) card.questionControls.setActive(asyncQuestionCards.includes(card));
+  $('questions').hidden = !syncQuestionCards.length && !asyncQuestionCards.length;
+  syncKeyboard();
+}
+
+function updateAsyncControls() {
+  for (const article of asyncQuestionCards) {
+    const statuses = article.questions.map(question => delivery.questionStatus(article.threadId, question.id));
+    const waiting = statuses.some(status => status === 'pending' || status === 'submitted');
+    article.questionControls.setResolved([...(article.resolved ?? []), ...article.questions.filter((question, index) => statuses[index] === 'answered').map(question => question.id)]);
+    article.questionControls.setLocked(!connected || selecting || sending || stopping || slashBusy || creating || archiveBusy || uncertainSubmission || waiting);
+    article.dataset.submission = waiting ? 'waiting' : 'ready';
+    if (waiting) article.feedback.textContent = statuses.includes('pending') ? '提交结果待确认，请查询发送结果。' : '回答已提交，等待对话同步。';
+    else if (article.feedback.dataset.waiting === 'true') article.feedback.textContent = '';
+    article.feedback.dataset.waiting = String(waiting);
+  }
+}
+
+function renderAsyncQuestions(thread) {
+  const id = thread.id ?? threadId;
+  if (id !== threadId || (selecting && selectingThread !== id)) return;
+  const state = collectAsyncQuestions(thread, active[id]);
+  // Observing desktop answers must still render when browser storage is full.
+  for (const turn of thread.turns ?? []) for (const item of turnItems(turn)) {
+    const replies = replyForItem(item);
+    try {
+      if (replies) delivery.recordQuestions(id, replies.map(reply => reply.questionItemId), 'answered');
+    } catch { /* Accepted history below remains authoritative without persistence. */ }
+  }
+  asyncQuestionCards = [];
+  for (const group of state.pending) {
+    if (group.questions.every(question => delivery.questionStatus(id, question.id) === 'answered')) continue;
+    const key = JSON.stringify([id, group.turnId, group.itemId]);
+    let article = asyncCards.get(key);
+    const allQuestions = [...state.questions.values()].filter(question => JSON.parse(question.id)[1] === group.itemId);
+    const signature = JSON.stringify(allQuestions);
+    if (!article || article.dataset.signature !== signature) {
+      const saved = article?.questionControls.capture();
+      article?.questionControls.setActive(false);
+      const focus = article && document.activeElement?.dataset.questionId;
+      const selectionStart = focus ? document.activeElement.selectionStart : null;
+      article = document.createElement('article'); article.className = 'approval-card async-question-card'; article.tabIndex = -1;
+      article.threadId = id; article.questions = allQuestions; article.dataset.question = 'true'; article.dataset.signature = signature;
+      const heading = document.createElement('h2'); heading.textContent = '需要你的回答';
+      const feedback = document.createElement('p'); feedback.setAttribute('role', 'status'); article.feedback = feedback;
+      article.questionControls = questionCard(allQuestions, async result => {
+        if (id !== threadId || !asyncQuestionCards.includes(article)) return;
+        const current = collectAsyncQuestions(timeline.thread(id), active[id]).pending.flatMap(group => group.questions);
+        const questions = article.questions.filter(question => current.some(candidate => candidate.id === question.id) && !delivery.questionStatus(id, question.id));
+        const text = serializeQuestionReply(questions, result);
+        if (!text) return;
+        feedback.textContent = '正在提交…';
+        try { await send(!!active[id], text, questions.map(question => question.id)); }
+        catch (error) { feedback.textContent = uncertainSubmission ? '提交结果待确认，请查询发送结果。' : `发送失败：${error.message}。回答已保留，可重试。`; }
+        renderAsyncQuestions(timeline.thread(id));
+      }, saved, 60_000);
+      article.restoreFocus = focus ? { id: focus, selectionStart } : null;
+      article.append(heading, article.questionControls.form, feedback); asyncCards.set(key, article);
+    }
+    // Keep every original input mounted while desktop answers resolve individual questions.
+    const unresolved = new Set(group.questions.map(question => question.id));
+    article.resolved = article.questions.filter(question => !unresolved.has(question.id)).map(question => question.id);
+    asyncQuestionCards.push(article);
+  }
+  updateAsyncControls(); renderQuestionDock(); renderApprovalReminders();
+  for (const article of asyncQuestionCards) if (article.restoreFocus) {
+    const input = [...article.querySelectorAll('input')].find(input => input.dataset.questionId === article.restoreFocus.id);
+    if (input && !input.disabled) { input.focus({ preventScroll: true }); input.setSelectionRange(article.restoreFocus.selectionStart, article.restoreFocus.selectionStart); }
+    article.restoreFocus = null;
+  }
+}
+
 function locateApproval() {
   const card = $('approvals').querySelector('.approval-card') || $('questions').querySelector('.approval-card');
   if (!card) return;
@@ -1353,8 +1455,9 @@ function locateApproval() {
 function renderApprovalReminders() {
   const entries = pendingApprovals.entries();
   const current = entries.get(threadId);
-  const label = approvalLabel(current);
-  $('approval-reminder').hidden = !current;
+  const asyncCount = asyncQuestionCards.length;
+  const label = [current ? approvalLabel(current) : '', asyncCount ? `${asyncCount} 组异步问题${asyncQuestionCards.some(card => card.dataset.submission === 'waiting') ? '等待同步' : '待回答'}` : ''].filter(Boolean).join(' · ');
+  $('approval-reminder').hidden = !current && !asyncCount;
   $('approval-reminder-text').textContent = label;
   $('open-current-approval').disabled = selecting;
   $('open-current-approval').textContent = current?.uncertain ? '核对请求' : current && (current.desktop.length || current.requests.some(request => !isAnswerable(request))) ? '查看详情' : '去处理';
@@ -1389,6 +1492,9 @@ function renderApprovalReminders() {
     for (const control of article.querySelectorAll('button, input, select')) control.disabled = !connected || selecting || article.dataset.responding === 'true';
     article.questionControls?.setLocked(!connected || selecting || article.dataset.responding === 'true');
   }
+  updateAsyncControls();
+  $('jump-approvals').hidden = !current && !asyncCount;
+  $('jump-approvals').textContent = label;
 }
 
 function renderApprovals() {
@@ -1480,6 +1586,7 @@ function renderApprovals() {
   for (const [id, question] of [['approvals', false], ['questions', true]]) {
     const container = $(id);
     const entries = cards.filter(card => (card.dataset.question === 'true') === question);
+    if (question) { syncQuestionCards = entries; renderQuestionDock(); continue; }
     for (const card of [...container.children]) if (!entries.includes(card)) card.remove();
     entries.forEach((card, index) => {
       if (container.children[index] !== card) container.insertBefore(card, container.children[index] ?? null);
@@ -1826,9 +1933,12 @@ $('reconcile').onclick = () => {
   updateControls();
 };
 $('check-receipt').onclick = () => recoverSubmission().then(poll).catch(showError);
-async function send(steer, quickText) {
+async function send(steer, quickText, questionIds) {
   if (archiveBusy || archiveStates.get(threadId)) throw Error('请先确认会话归档状态或恢复会话');
-  if (sending || selecting || stopping || slashBusy || creating || composingText || composerAttachments.reading()) return;
+  if (sending || selecting || stopping || slashBusy || creating || composingText || composerAttachments.reading()) {
+    if (questionIds) throw Error('操作正在进行，请稍后回答');
+    return;
+  }
   const text = quickText ?? $('message').value;
   if (text.trim().startsWith('/')) {
     if (composerAttachments.hasImages()) throw Error('附件不能随 / 命令发送，请输入普通消息。');
@@ -1846,7 +1956,7 @@ async function send(steer, quickText) {
       threadId, input: [...(text.trim() ? [{ type: 'text', text }] : []), ...attachments],
       ...(steer ? { expectedTurnId: active[threadId] } : {}),
       ...planMode.params(threadId, currentModelSetting(threadId), submittedModelSetting?.setting, steer),
-    });
+    }, undefined, questionIds);
     finishModelSubmission(true);
     freshThreads.delete(threadId);
     deliveryOutcomes.set(threadId, '已接收');

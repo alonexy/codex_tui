@@ -20,6 +20,7 @@ const assets = new Map([
   ['/approval-state.js', ['approval-state.js', 'text/javascript; charset=utf-8']],
   ['/plan-mode.js', ['plan-mode.js', 'text/javascript; charset=utf-8']],
   ['/question-card.js', ['question-card.js', 'text/javascript; charset=utf-8']],
+  ['/async-questions.js', ['async-questions.js', 'text/javascript; charset=utf-8']],
   ['/composer-media.js', ['composer-media.js', 'text/javascript; charset=utf-8']],
   ['/attachment-policy.js', ['attachment-policy.js', 'text/javascript; charset=utf-8']],
   ['/history-pages.js', ['history-pages.js', 'text/javascript; charset=utf-8']],

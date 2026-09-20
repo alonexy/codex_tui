@@ -4,6 +4,12 @@ export class DeliveryState {
     this.storage = storage;
     this.pending = null;
     this.createdNaming = null;
+    this.questionSubmissions = new Map();
+    try {
+      for (const [id, entries] of JSON.parse(storage.getItem('codex-question-submissions') || '[]')) {
+        if (typeof id === 'string' && Array.isArray(entries)) this.questionSubmissions.set(id, new Map(entries.filter(([key, value]) => typeof key === 'string' && ['submitted', 'answered'].includes(value))));
+      }
+    } catch { /* Only receipt IDs and question identities are restored, never answer contents. */ }
     try {
       const created = JSON.parse(storage.getItem('codex-created-name') || 'null');
       if (created && typeof created.threadId === 'string' && typeof created.name === 'string') this.createdNaming = created;
@@ -16,10 +22,11 @@ export class DeliveryState {
       }
     } catch { /* Browsers may deny storage. begin() fails before sending in that case. */ }
   }
-  begin(key, method, threadId, name) {
+  begin(key, method, threadId, name, questionIds) {
     if (this.pending) throw Error('上次提交结果待确认，请先查询发送结果');
     const pending = { key, method, threadId, createdAt: Date.now() };
     if (['thread/start', 'thread/name/set'].includes(method) && typeof name === 'string' && name.trim()) pending.name = name.trim();
+    if (['turn/start', 'turn/steer'].includes(method) && Array.isArray(questionIds) && questionIds.length) pending.questionIds = [...new Set(questionIds.filter(id => typeof id === 'string'))];
     try {
       if (method === 'thread/name/set' && this.createdNaming?.threadId === threadId && pending.name) {
         const created = { ...this.createdNaming, name: pending.name };
@@ -41,6 +48,7 @@ export class DeliveryState {
       this.createdNaming = created;
     }
     if (status === 'completed' && this.pending.method === 'thread/name/set') this.finishNaming(this.pending.threadId);
+    if (status === 'completed' && this.pending.questionIds?.length) this.recordQuestions(this.pending.threadId, this.pending.questionIds, 'submitted');
     this.clear();
     return true;
   }
@@ -52,6 +60,25 @@ export class DeliveryState {
   clear() {
     this.storage.removeItem('codex-pending');
     this.pending = null;
+  }
+  questionStatus(threadId, id) {
+    const value = this.questionSubmissions.get(threadId)?.get(id);
+    if (value === 'answered') return value;
+    return this.pending?.threadId === threadId && this.pending.questionIds?.includes(id) ? 'pending' : value;
+  }
+  recordQuestions(threadId, ids, status) {
+    const entries = new Map(this.questionSubmissions.get(threadId));
+    let changed = false;
+    for (const id of ids) {
+      if (entries.get(id) === 'answered' || entries.get(id) === status) continue;
+      if (status) entries.set(id, status); else entries.delete(id);
+      changed = true;
+    }
+    if (!changed) return;
+    const next = new Map(this.questionSubmissions); next.set(threadId, entries);
+    // Save before clearing a completed receipt so reload cannot enable a duplicate submission.
+    this.storage.setItem('codex-question-submissions', JSON.stringify([...next].map(([id, values]) => [id, [...values]])));
+    this.questionSubmissions = next;
   }
 }
 

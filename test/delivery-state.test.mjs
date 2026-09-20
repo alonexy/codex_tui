@@ -67,3 +67,99 @@ test('failed handoff storage retains the confirmed creation receipt instead of p
   assert.equal(new DeliveryState(store).pending.key, 'create');
   assert.throws(() => state.begin('again', 'thread/start'), /待确认/);
 });
+
+test('question receipts restore pending identities without allowing another submission', () => {
+  for (const method of ['turn/start', 'turn/steer']) {
+    const store = storage(), state = new DeliveryState(store);
+    const ids = ['question-1', 'question-2'];
+    state.begin('question-send', method, 'task', undefined, [...ids, ids[0]]);
+    const restored = new DeliveryState(store);
+    assert.deepEqual(restored.pending.questionIds, ids);
+    for (const id of ids) assert.equal(restored.questionStatus('task', id), 'pending');
+    assert.equal(restored.questionStatus('other-task', ids[0]), undefined);
+    assert.equal(restored.questionStatus('task', 'other-question'), undefined);
+    assert.equal(restored.settle('question-send', 'pending'), false);
+    assert.equal(restored.settle('another-receipt', 'completed'), false);
+    assert.throws(() => restored.begin('duplicate', method, 'task', undefined, ids), /待确认/);
+    assert.equal(new DeliveryState(store).questionStatus('task', ids[0]), 'pending');
+  }
+});
+
+test('completed question receipts suppress history lag and answered status never regresses', () => {
+  const store = storage(), state = new DeliveryState(store);
+  state.begin('question-send', 'turn/steer', 'task', undefined, ['question']);
+  assert.equal(state.settle('question-send', 'completed'), true);
+  const restored = new DeliveryState(store);
+  assert.equal(restored.pending, null);
+  assert.equal(restored.questionStatus('task', 'question'), 'submitted');
+  restored.recordQuestions('task', [], 'answered');
+  assert.equal(restored.questionStatus('task', 'question'), 'submitted');
+  restored.recordQuestions('task', ['question'], 'answered');
+  restored.recordQuestions('task', ['question'], 'submitted');
+  restored.recordQuestions('task', ['question'], undefined);
+  assert.equal(new DeliveryState(store).questionStatus('task', 'question'), 'answered');
+  assert.equal(restored.questionStatus('other-task', 'question'), undefined);
+});
+
+test('question receipt storage persists identities and status without answer contents', () => {
+  const store = storage(), state = new DeliveryState(store);
+  const secretAnswer = 'PRIVATE-ANSWER-MUST-NOT-PERSIST';
+  state.begin('question-send', 'turn/start', 'task', secretAnswer, ['question']);
+  const pending = JSON.parse(store.getItem('codex-pending'));
+  assert.deepEqual(Object.keys(pending).sort(), ['createdAt', 'key', 'method', 'questionIds', 'threadId']);
+  assert.ok(!JSON.stringify(pending).includes(secretAnswer));
+  state.settle('question-send', 'completed', { answer: secretAnswer, thread: { turns: [{ text: secretAnswer }] } });
+  state.recordQuestions('task', ['question'], 'answered');
+  assert.equal(store.getItem('codex-pending'), null);
+  assert.equal(store.getItem('codex-created-name'), null);
+  assert.deepEqual(JSON.parse(store.getItem('codex-question-submissions')), [['task', [['question', 'answered']]]]);
+});
+
+test('failed question receipts release pending state and permit an explicit retry', () => {
+  const store = storage(), state = new DeliveryState(store);
+  state.begin('failed-send', 'turn/steer', 'task', undefined, ['question']);
+  assert.equal(state.settle('failed-send', 'failed'), true);
+  const restored = new DeliveryState(store);
+  assert.equal(restored.pending, null);
+  assert.equal(restored.questionStatus('task', 'question'), undefined);
+  restored.begin('retry-send', 'turn/steer', 'task', undefined, ['question']);
+  assert.equal(restored.questionStatus('task', 'question'), 'pending');
+  assert.equal(restored.settle('failed-send', 'completed'), false);
+  assert.equal(restored.settle('retry-send', 'completed'), true);
+  assert.equal(new DeliveryState(store).questionStatus('task', 'question'), 'submitted');
+});
+
+test('question submission storage failure retains the receipt until it can be safely settled', () => {
+  const store = storage(), state = new DeliveryState(store);
+  state.begin('question-send', 'turn/steer', 'task', undefined, ['question']);
+  const write = store.setItem;
+  store.setItem = (key, value) => {
+    if (key === 'codex-question-submissions') throw Error('question storage denied');
+    return write(key, value);
+  };
+  assert.throws(() => state.settle('question-send', 'completed'), /question storage denied/);
+  assert.equal(state.pending.key, 'question-send');
+  assert.equal(state.questionStatus('task', 'question'), 'pending');
+  const restored = new DeliveryState(store);
+  assert.equal(restored.pending.key, 'question-send');
+  assert.equal(restored.questionStatus('task', 'question'), 'pending');
+  assert.throws(() => restored.begin('duplicate', 'turn/steer', 'task'), /待确认/);
+  store.setItem = write;
+  assert.equal(restored.settle('question-send', 'completed'), true);
+  assert.equal(new DeliveryState(store).questionStatus('task', 'question'), 'submitted');
+});
+
+test('failed receipt removal preserves pending identity after saving submitted status', () => {
+  const store = storage(), state = new DeliveryState(store);
+  state.begin('question-send', 'turn/start', 'task', undefined, ['question']);
+  const remove = store.removeItem;
+  store.removeItem = () => { throw Error('receipt removal denied'); };
+  assert.throws(() => state.settle('question-send', 'completed'), /receipt removal denied/);
+  assert.equal(state.pending.key, 'question-send');
+  const restored = new DeliveryState(store);
+  assert.equal(restored.questionStatus('task', 'question'), 'pending');
+  assert.throws(() => restored.begin('duplicate', 'turn/start', 'task'), /待确认/);
+  store.removeItem = remove;
+  assert.equal(restored.settle('question-send', 'completed'), true);
+  assert.equal(new DeliveryState(store).questionStatus('task', 'question'), 'submitted');
+});

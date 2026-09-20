@@ -184,7 +184,7 @@ main { max-width: 800px; padding-top: 4px; }
 .composer-box:focus-within { border-color: #777; box-shadow: 0 0 0 1px #777; }
 .composer-box #message { font-size: 16px; line-height: 1.5; overscroll-behavior: contain; }
 .composer-box #message:focus-visible { outline: none; }
-#delivery-status:empty { display: none; }
+#delivery-status { min-height: 1.6em; }
 #status-details { overflow-wrap: anywhere; }
 .task-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0; margin: 6px 0 6px 8px; }
 .task-row .task-card { flex: 1; min-width: 0; margin: 0; padding: 10px; }
@@ -252,6 +252,10 @@ main:has(#interaction-dock) { padding-bottom: 0; }
 #questions .approval-card > h2 { display: none; }
 #questions .approval-card > [role="status"] { flex: 0 0 auto; margin: 4px 0; font-size: .75rem; }
 #questions .approval-card > [role="status"]:empty { display: none; }
+#questions .async-question-card[data-submission="waiting"] .question-form { display: none; }
+.question-history, .question-answer { margin: 12px 0; padding: 10px 12px; border-left: 2px solid var(--accent); overflow-wrap: anywhere; }
+.question-history ol, .question-answer p { margin: 8px 0 0; }
+.message.steeringUserMessage { background: var(--surface); }
 #questions .question-form, #questions .question-body { display: flex; flex-direction: column; min-height: 0; }
 #questions .question-top, #questions .question-tabs, #questions .question-footer { flex: 0 0 auto; }
 #questions .question-scroll { min-height: 48px; overflow-y: auto; overscroll-behavior: contain; }

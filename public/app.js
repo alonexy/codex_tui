@@ -10,6 +10,7 @@ import { ApprovalState, approvalLabel, isAnswerable } from './approval-state.js'
 import { PlanMode, modeLabel } from './plan-mode.js';
 import { questionCard } from './question-card.js';
 import { questionsForItem, replyForItem, serializeQuestionReply, collectAsyncQuestions } from './async-questions.js';
+import { fencedBlock, mermaidBlock } from './mermaid.js';
 const $ = id => document.getElementById(id);
 sessionStorage.removeItem('codex-token');
 let threadId = '';
@@ -574,16 +575,34 @@ function inlineText(node, text) {
   node.append(document.createTextNode(text.slice(offset)));
 }
 
-function renderText(container, text) {
-  let code = null;
+function renderText(container, text, previous) {
   let list = null;
+  const diagrams = [...(previous?.querySelectorAll('.mermaid-block') ?? [])];
   const lines = text.split('\n');
   const cells = line => line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    const picture = !code && line.match(/^!\[([^\]]*)\]\((.+)\)\s*$/);
+    const fence = fencedBlock(lines, index);
+    if (fence) {
+      list = null;
+      if (fence.language === 'mermaid' && fence.closed) {
+        const index = diagrams.findIndex(node => node.mermaidSource === fence.source);
+        container.append(index < 0 ? mermaidBlock(fence.source) : diagrams.splice(index, 1)[0]);
+      } else {
+        const source = document.createElement('pre'); source.textContent = fence.source;
+        const copy = document.createElement('button');
+        copy.type = 'button'; copy.className = 'secondary copy-code'; copy.textContent = '复制代码';
+        copy.onclick = async () => {
+          try { await navigator.clipboard.writeText(source.textContent); copy.textContent = '已复制'; }
+          catch { copy.textContent = '复制失败，请长按代码选择'; }
+        };
+        container.append(copy, source);
+      }
+      index = fence.end; continue;
+    }
+    const picture = line.match(/^!\[([^\]]*)\]\((.+)\)\s*$/);
     if (picture) { appendImage(container, picture[2], picture[1] || '任务图片'); continue; }
-    if (!code && line.includes('|') && lines[index + 1]?.includes('|') && cells(lines[index + 1]).every(cell => /^:?-{3,}:?$/.test(cell))) {
+    if (line.includes('|') && lines[index + 1]?.includes('|') && cells(lines[index + 1]).every(cell => /^:?-{3,}:?$/.test(cell))) {
       list = null;
       const wrapper = document.createElement('div'); wrapper.className = 'table-scroll';
       wrapper.tabIndex = 0; wrapper.setAttribute('role', 'region'); wrapper.setAttribute('aria-label', '表格，可左右滚动');
@@ -605,7 +624,7 @@ function renderText(container, text) {
       table.append(body); wrapper.append(table); container.append(wrapper);
       continue;
     }
-    const item = !code && line.match(/^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/);
+    const item = line.match(/^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/);
     if (item) {
       const tag = item[2] ? 'OL' : 'UL';
       if (!list || list.tagName !== tag) {
@@ -617,26 +636,10 @@ function renderText(container, text) {
       continue;
     }
     list = null;
-    if (line.startsWith('```')) {
-      if (code) code = null;
-      else {
-        code = document.createElement('pre');
-        const source = code;
-        const copy = document.createElement('button');
-        copy.type = 'button'; copy.className = 'secondary copy-code'; copy.textContent = '复制代码';
-        copy.onclick = async () => {
-          try { await navigator.clipboard.writeText(source.textContent); copy.textContent = '已复制'; }
-          catch { copy.textContent = '复制失败，请长按代码选择'; }
-        };
-        container.append(copy, code);
-      }
-    } else if (code) code.textContent += line + '\n';
-    else {
-      const heading = line.match(/^(#{1,6})\s+(.*)$/);
-      const node = document.createElement(heading ? 'h3' : 'div');
-      inlineText(node, heading ? heading[2] : line || '\u00a0');
-      container.append(node);
-    }
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    const node = document.createElement(heading ? 'h3' : 'div');
+    inlineText(node, heading ? heading[2] : line || '\u00a0');
+    container.append(node);
   }
 }
 
@@ -678,7 +681,7 @@ function renderHistoryItem(view, key, item, questions, replies) {
       const answer = document.createElement('p'); answer.textContent = reply.answer;
       pair.append(title, answer); content.append(pair);
     }
-    else if (text) renderText(content, text);
+    else if (text) renderText(content, text, block);
     for (const question of questionsForItem(item)) {
       const section = document.createElement('div'); section.className = 'question-history';
       const title = document.createElement('strong'); title.textContent = question.question;

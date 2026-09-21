@@ -1,4 +1,7 @@
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { createAuth, deviceName } from './auth.mjs';
 import { createAudit } from './audit.mjs';
@@ -13,10 +16,12 @@ import { loginSource } from './login-source.mjs';
 import { threadModes } from './thread-mode.mjs';
 
 const readOnlyRpc = new Set(['thread/list', 'thread/read', 'thread/resume', 'thread/items/list', 'thread/turns/list', 'thread/goal/get']);
+const compress = promisify(gzip);
 
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/mermaid.js', ['mermaid.js', 'text/javascript; charset=utf-8']],
   ['/approval-state.js', ['approval-state.js', 'text/javascript; charset=utf-8']],
   ['/plan-mode.js', ['plan-mode.js', 'text/javascript; charset=utf-8']],
   ['/question-card.js', ['question-card.js', 'text/javascript; charset=utf-8']],
@@ -104,6 +109,21 @@ export function createWebServer(broker, { password, origin, mode, now, allowLanH
       if (authenticated && url.pathname === '/login') {
         res.writeHead(303, { Location: '/' });
         return res.end();
+      }
+      if (req.method === 'GET' && url.pathname === '/mermaid-renderer') {
+        // Only trusted, generated code enters this document. Graph source travels
+        // via postMessage, never via HTML. Inline the bundle to avoid sending
+        // authenticated subrequests from the opaque sandbox origin.
+        const script = await readFile(new URL('../public/vendor/mermaid-renderer.js', import.meta.url), 'utf8');
+        const nonce = randomBytes(24).toString('base64');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Content-Security-Policy', `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; sandbox allow-scripts`);
+        const html = `<!doctype html><html><head><meta charset="utf-8"></head><body><script nonce="${nonce}">${script.replace(/<\/script/gi, '<\\/script')}</script></body></html>`;
+        res.setHeader('Vary', 'Accept-Encoding');
+        if (/\bgzip\b(?!\s*;\s*q=0(?:\.0*)?(?:\s*,|\s*$))/i.test(req.headers['accept-encoding'] ?? '')) {
+          res.setHeader('Content-Encoding', 'gzip'); res.end(await compress(html));
+        } else res.end(html);
+        return;
       }
       if (req.method === 'POST' && url.pathname === '/api/logout') {
         record('success');

@@ -9,6 +9,7 @@ import { taskPreferences } from '../public/task-preferences.js';
 import { ApprovalState, approvalLabel, isAnswerable } from '../public/approval-state.js';
 import { formatBytes } from '../public/attachment-policy.js';
 import { PlanMode, modeLabel } from '../public/plan-mode.js';
+import { fencedBlock } from '../public/mermaid.js';
 import { questionsForItem, replyForItem, parseQuestionReply, serializeQuestionReply, collectAsyncQuestions } from '../public/async-questions.js';
 
 function composer(storage = { getItem() { return null; }, setItem() {} }, session = { removeItem() {}, getItem() { return null; }, setItem() {} }) {
@@ -66,6 +67,7 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     PlanMode, modeLabel,
     questionsForItem, replyForItem, parseQuestionReply, serializeQuestionReply, collectAsyncQuestions,
     formatBytes,
+    fencedBlock,
     taskPreferences: () => taskPreferences(storage),
     goalPanel: () => ({ open: async () => {}, event() {} }),
   });

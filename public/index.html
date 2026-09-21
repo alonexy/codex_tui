@@ -79,7 +79,7 @@
       <p id="search-scope" class="muted small">项目与桌面项目配置同步。输入可筛选已加载任务，也可搜索历史标题。</p>
     </dialog>
     <dialog id="archive-dialog" aria-labelledby="archive-title">
-      <h2 id="archive-title">归档会话</h2><p id="archive-target" style="overflow-wrap:anywhere"></p>
+      <h2 id="archive-title">归档会话</h2><p id="archive-target"></p>
       <p id="archive-hint" class="muted small">归档后可在“已归档”列表中恢复。未发送的草稿将保留在当前页面。</p>
       <p id="archive-error" class="error" role="alert"></p>
       <div class="toolbar"><button id="archive-confirm" type="button">确认归档</button><button id="archive-cancel" type="button" class="secondary" autofocus>取消</button><button id="archive-receipt" type="button" class="secondary" hidden>查询操作结果</button></div>
@@ -124,7 +124,7 @@
         <details id="project-workspace">
           <summary>高级选项：起始目录</summary>
           <label for="workspace-choice">起始目录（可选调整）</label><select id="workspace-choice" aria-describedby="workspace-path workspace-hint"></select>
-          <p id="workspace-path" class="muted small" style="overflow-wrap:anywhere"></p>
+          <p id="workspace-path" class="muted small"></p>
           <p id="workspace-hint" class="muted small">仅决定最初从哪里开始，会话仍可在项目的全部目录中工作。</p>
         </details>
         <div id="custom-project"><label for="project-path">电脑上的项目路径</label><input id="project-path" required placeholder="/Users/你/Code/项目" autocapitalize="off" spellcheck="false"></div>

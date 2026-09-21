@@ -34,6 +34,30 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; font: .9rem/1.6 ui-monospa
 .message.userMessage { border-left: 3px solid var(--accent); }
 .message > strong { color: var(--accent); font-size: .875rem; }
 .message-body { margin-top: 10px; line-height: 1.8; white-space: pre-wrap; }
+.mermaid-block { margin: 12px 0; white-space: normal; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.mermaid-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px; }
+.mermaid-toolbar > span:first-child, .mermaid-toolbar > strong { margin-right: auto; }
+.mermaid-toolbar button { padding: 6px 10px; font-size: .875rem; }
+.mermaid-block > p, .mermaid-block > pre { margin: 8px 12px; }
+.mermaid-preview { display: block; width: 100%; border: 0; border-radius: 0; padding: 12px; background: #fff; }
+.mermaid-preview img { display: block; width: 100%; height: auto; max-height: 420px; object-fit: contain; }
+.mermaid-renderer { position: fixed; left: -10000px; top: 0; width: 1200px; height: 900px; border: 0; pointer-events: none; }
+.mermaid-dialog { width: calc(100vw - 16px); max-width: 1400px; height: calc(100dvh - 32px); max-height: calc(100dvh - 32px); padding: 8px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 12px; }
+.mermaid-dialog[open] { display: flex; flex-direction: column; }
+.mermaid-dialog::backdrop { background: #000b; }
+.mermaid-dialog > p { margin: 0 8px 8px; }
+.mermaid-dialog .mermaid-toolbar { flex: 0 0 auto; }
+.mermaid-dialog .mermaid-toolbar button { min-width: 44px; padding-inline: 8px; }
+.mermaid-dialog output { min-width: 42px; text-align: center; }
+@media (max-width: 360px) {
+  .mermaid-dialog .mermaid-toolbar { flex-wrap: nowrap; gap: 4px; }
+  .mermaid-dialog .mermaid-toolbar > strong { display: none; }
+  .mermaid-dialog .mermaid-toolbar button:last-child { margin-left: auto; }
+}
+.mermaid-viewport { flex: 1; min-height: 0; overflow: auto; background: #fff; border-radius: 8px; touch-action: none; overscroll-behavior: contain; cursor: grab; }
+.mermaid-viewport:active { cursor: grabbing; }
+.mermaid-canvas { display: flex; align-items: center; justify-content: center; width: max-content; min-width: 100%; min-height: 100%; padding: 12px; }
+.mermaid-canvas img { display: block; max-width: none; flex: none; user-select: none; }
 .message-body h3 { font-size: 1.1rem; margin: 12px 0 4px; }
 .message-body a { color: #b9d6ff; text-decoration: underline; text-underline-offset: 3px; }
 .message-body ul, .message-body ol { white-space: normal; padding-left: 24px; margin: 8px 0; }

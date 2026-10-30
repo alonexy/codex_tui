@@ -6,11 +6,14 @@ import { goalPanel } from './goal-panel.js';
 import { taskPreferences } from './task-preferences.js';
 import { DeliveryState, deliveryLabel } from './delivery-state.js';
 import { devicePanel } from './device-panel.js';
-import { ApprovalState, approvalLabel, isAnswerable } from './approval-state.js';
+import { ApprovalState, approvalLabel, isAnswerable, isMcpUrlElicitation, mcpApprovalMethod } from './approval-state.js';
 import { PlanMode, modeLabel } from './plan-mode.js';
 import { questionCard } from './question-card.js';
 import { questionsForItem, replyForItem, serializeQuestionReply, collectAsyncQuestions } from './async-questions.js';
 import { fencedBlock, mermaidBlock } from './mermaid.js';
+import { AccountQuota, quotaPeriod } from './account-quota.js';
+import { imagePreview } from './image-preview.js';
+import { SessionLoader, trimSessions } from './session-loader.js';
 const $ = id => document.getElementById(id);
 sessionStorage.removeItem('codex-token');
 let threadId = '';
@@ -18,7 +21,13 @@ let cursor = 0;
 let active = {};
 let nextCursor = null;
 let connected = false;
+let connectionEpoch = 0;
+const accountQuota = new AccountQuota();
+let quotaReadable = false, quotaLoading = false, quotaReadAt = 0;
+const modelSnapshots = new Map();
 let approvalSignature = '';
+let pendingThread = null;
+let mcpUrlElicitation = false;
 const approvalCards = new Map();
 const asyncCards = new Map();
 let syncQuestionCards = [], asyncQuestionCards = [];
@@ -26,9 +35,43 @@ const pendingApprovals = new ApprovalState();
 let pendingListSignature = '';
 let log = '';
 let polling = false;
+let accessEnded = false;
 let sending = false;
 let stopping = false;
 let followingLatest = true;
+let readingIntent = 0;
+let readingRestore = null;
+function beginReadingRestore(position) {
+  if (!position) return;
+  position.anchor = document.documentElement.style.overflowAnchor;
+  readingRestore = position;
+  // This transaction can resize the approval/composer area before hydration
+  // starts selecting. Suspend native anchoring only until that read completes.
+  document.documentElement.style.overflowAnchor = 'none';
+}
+function finishReadingRestore(position, restore = true) {
+  if (!position || readingRestore !== position) return;
+  if (restore) restoreReadingPosition(position);
+  document.documentElement.style.overflowAnchor = position.anchor ?? '';
+  readingRestore = null;
+}
+function captureReadingPosition() {
+  if (images.active) return null;
+  if (!threadId || (followingLatest && !document.activeElement?.closest?.('.approval-card'))) return null;
+  return { threadId, top: window.scrollY, intent: readingIntent };
+}
+function restoreReadingPosition(position) {
+  if (images.active || !position || position.threadId !== threadId || position.intent !== readingIntent) return;
+  followingLatest = false;
+  cancelAnimationFrame(scrollFrame);
+  window.scrollTo({ top: position.top, behavior: 'instant' });
+}
+window.addEventListener('wheel', () => { readingIntent++; }, { passive: true });
+window.addEventListener('touchmove', () => { readingIntent++; }, { passive: true });
+window.addEventListener('pointerdown', () => { readingIntent++; }, { passive: true });
+window.addEventListener('keydown', event => {
+  if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) readingIntent++;
+});
 let scrollFrame = 0;
 let selecting = false;
 let selectingThread = '';
@@ -47,10 +90,38 @@ let slashBusy = false;
 let creating = false;
 const historyPages = new HistoryPages(command, (id, turns) => {
   timeline.metadata(id, turns);
-  if (threadId === id) renderHistory(timeline.thread(id), true);
-});
+  if (threadId === id) renderLiveHistory(id);
+}, () => new Set([threadId, selectingThread]));
 const timeline = new Timeline();
 const historyViews = new Map();
+const sessionLoader = new SessionLoader();
+function invalidateConnectionReads() {
+  finishReadingRestore(readingRestore, false);
+  connectionEpoch++;
+  selection++; selecting = false; selectingThread = '';
+  historyPages.invalidate();
+  sessionLoader.invalidateReads();
+  modeReads.clear(); modeReadAt.clear();
+  listing = false;
+}
+function onOffline() {
+  connected = false; tasksLoaded = false; archiveRevision++;
+  invalidateConnectionReads();
+  accountQuota.disconnect(); pendingApprovals.disconnect(); renderApprovals();
+  $('status').textContent = '连接中断 · 等待网络';
+  updateControls();
+}
+function pruneHistory() {
+  const protectedIds = new Set([threadId, selectingThread, ...historyPages.pending.keys(), ...historyPages.metadataPending.keys()]);
+  trimSessions(historyViews, protectedIds);
+  historyPages.prune(protectedIds);
+  timeline.prune(protectedIds);
+}
+function renderLiveHistory(id) {
+  const view = historyViews.get(id);
+  if (view?.revision === timeline.revision(id) && view?.active === active[id]) return;
+  renderHistory(timeline.thread(id), true);
+}
 const taskStatus = new Map();
 let composingText = false;
 let threads = new Map();
@@ -96,20 +167,33 @@ const composerAttachments = composerMedia({ getThread: () => threadId, busy: () 
   uploaded: (file, preview) => { fileAttachments.set(file.input.path, file); if (preview) mediaUrls.set(file.input.path, preview); },
 });
 devicePanel({ api });
+function leaveForLogin() {
+  accessEnded = true;
+  $('workspace').hidden = true;
+  for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
+  location.replace('/login');
+}
+import('./passkey-settings.js').then(({ passkeySettings }) => passkeySettings({ api, leave: leaveForLogin })).catch(() => {
+  $('manage-passkeys').disabled = true;
+  $('manage-passkeys').title = '通行密钥功能暂不可用，请稍后刷新';
+});
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const images = imagePreview({ changed: () => { readingIntent++; cancelAnimationFrame(scrollFrame); followingLatest = false; } });
 
 function scrollToLatest() {
   cancelAnimationFrame(scrollFrame);
   scrollFrame = requestAnimationFrame(() => {
-    if (!followingLatest || document.activeElement === $('message') || document.activeElement?.closest?.('.approval-card') || $('task-dialog').open || $('new-dialog').open) return;
+    if (images.active || !followingLatest || document.activeElement === $('message') || document.activeElement?.closest?.('.approval-card') || $('task-dialog').open || $('pending-dialog').open || $('new-dialog').open) return;
     $('events').scrollTop = $('events').scrollHeight;
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' });
   });
 }
 window.addEventListener('scroll', () => {
+  if (images.active) return;
   followingLatest = document.documentElement.scrollHeight - window.scrollY - window.innerHeight < 80;
 }, { passive: true });
 $('events').addEventListener('scroll', () => {
+  if (images.active) return;
   if ($('events').scrollHeight - $('events').scrollTop - $('events').clientHeight > 32) followingLatest = false;
 }, { passive: true });
 new ResizeObserver(() => { if (followingLatest) scrollToLatest(); }).observe($('history'));
@@ -124,9 +208,8 @@ async function api(path, data) {
   });
   const result = await response.json();
   if (response.status === 401) {
-    $('workspace').hidden = true;
-    location.replace('/login');
-    throw new Error('登录已过期，请重新验证密码');
+    leaveForLogin();
+    throw new Error('会话已失效，请重新登录');
   }
   if (!response.ok) throw Object.assign(new Error(result.error ?? '请求失败'), { submission: result.submission });
   return result;
@@ -188,6 +271,7 @@ async function recoverSubmission() {
   const pending = delivery.pending;
   if (!pending || recovering || sending || stopping || slashBusy || creating || archiveBusy) return;
   recovering = true;
+  const epoch = connectionEpoch;
   try {
     const record = await api(`/api/commands/${encodeURIComponent(pending.key)}`);
     if (!delivery.settle(pending.key, record.status, record.result)) return;
@@ -197,6 +281,9 @@ async function recoverSubmission() {
     planMode.finish(pending.key, success);
     if (submittedModelSetting?.key === pending.key) finishModelSubmission(success);
     deliveryOutcomes.set(id, success ? '已接收 · 回执已确认' : '发送失败 · 服务已确认，可修改后重试');
+    // The receipt still confirms the original submission across a reconnect,
+    // but its old connection cannot choose tasks or mutate current UI/caches.
+    if (!connected || epoch !== connectionEpoch) { submittedDraft = null; return; }
     if (success) {
       $('error').textContent = '';
       for (const [path, url] of Object.entries(record.media ?? {})) mediaUrls.set(path, url);
@@ -211,6 +298,7 @@ async function recoverSubmission() {
         restoreCreatedNaming = false;
         try { await select(id); }
         catch (error) { showError(new Error(`会话已创建，请在列表中打开：${error.message}`)); }
+        if (!connected || epoch !== connectionEpoch) return;
         if (pending.name) {
           openCommandForm('/rename', pending.name, id, true);
           $('command-hint').textContent = '会话已创建。请保存名称以完成命名，不会重复创建会话。';
@@ -249,25 +337,29 @@ async function recoverSubmission() {
     submittedDraft = null;
   } catch {
     // Missing receipts after a bridge restart remain uncertain until history is checked.
-    $('error').textContent = '暂时无法确认上次提交。恢复后会继续查询；请勿重复发送。';
+    if (epoch === connectionEpoch) $('error').textContent = '暂时无法确认上次提交。恢复后会继续查询；请勿重复发送。';
   } finally { recovering = false; updateControls(); }
 }
 
 async function list(more = false) {
   if (listing) return;
   listing = true;
+  const epoch = connectionEpoch;
   for (const id of ['more', 'refresh', 'search-all', 'recent-tasks']) $(id).disabled = true;
   try {
     if (!more) {
       try {
         const metadata = await api('/api/projects');
+        if (!connected || epoch !== connectionEpoch) return;
         desktopProjectList = metadata.projects;
         projectAssignments = metadata.assignments;
-      } catch (error) { $('search-scope').textContent = `无法同步桌面项目：${error.message}`; }
+      } catch (error) { if (epoch === connectionEpoch) $('search-scope').textContent = `无法同步桌面项目：${error.message}`; }
     }
+    if (!connected || epoch !== connectionEpoch) return;
     const statusToken = pendingApprovals.token();
     const revision = archiveRevision;
     const result = await command('thread/list', { limit: 30, sortKey: 'updated_at', ...taskQuery, archived: archivedView, ...(more ? { cursor: nextCursor } : {}) });
+    if (!connected || epoch !== connectionEpoch) return;
     if (!more) threads.clear();
     for (const thread of result.data) {
       if (revision !== archiveRevision && archiveStates.has(thread.id) && archiveStates.get(thread.id) !== archivedView) continue;
@@ -284,8 +376,10 @@ async function list(more = false) {
     renderTasks();
     renderApprovals();
   } finally {
-    listing = false;
-    for (const id of ['more', 'refresh', 'search-all', 'recent-tasks']) $(id).disabled = false;
+    if (epoch === connectionEpoch) {
+      listing = false;
+      for (const id of ['more', 'refresh', 'search-all', 'recent-tasks']) $(id).disabled = false;
+    }
   }
 }
 
@@ -523,17 +617,22 @@ function messageText(content) {
   return '';
 }
 
-function appendImage(container, source, description = '任务图片') {
+function appendImage(container, source, description = '任务图片', previous = []) {
   const url = mediaUrls.get(source) ?? source;
   if (typeof url !== 'string' || !/^(\/api\/images\/|data:image\/(png|jpeg|gif|webp);base64,|https:\/\/)/i.test(url)) {
     const note = document.createElement('p'); note.className = 'muted small';
     note.textContent = '图片暂不可用：' + (description || '附件'); container.append(note); return;
   }
-  const link = document.createElement('a'); link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer';
-  link.className = 'image-attachment';
+  const index = previous.findIndex(button => button.previewSource === url);
+  const button = index < 0 ? document.createElement('button') : previous.splice(index, 1)[0];
+  button.type = 'button'; button.className = 'image-attachment';
+  button.previewSource = url; button.previewDescription = description;
+  button.setAttribute('aria-label', `预览图片：${description}`); button.setAttribute('aria-haspopup', 'dialog');
+  if (index >= 0) { button.querySelector('img').alt = description; container.append(button); return; }
+  button.addEventListener('click', () => images.open(button.previewSource, button.previewDescription, button));
   const img = document.createElement('img'); img.src = url; img.alt = description; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
-  img.onerror = () => { link.replaceWith(Object.assign(document.createElement('p'), { textContent: '图片已失效或暂时无法读取' })); };
-  link.append(img); container.append(link);
+  img.onerror = () => { button.replaceWith(Object.assign(document.createElement('p'), { textContent: '图片已失效或暂时无法读取' })); };
+  button.append(img); container.append(button);
 }
 
 function appendFile(container, attachment) {
@@ -575,7 +674,7 @@ function inlineText(node, text) {
   node.append(document.createTextNode(text.slice(offset)));
 }
 
-function renderText(container, text, previous) {
+function renderText(container, text, previous, imageButtons = [...(previous?.querySelectorAll('.image-attachment') ?? [])]) {
   let list = null;
   const diagrams = [...(previous?.querySelectorAll('.mermaid-block') ?? [])];
   const lines = text.split('\n');
@@ -601,7 +700,7 @@ function renderText(container, text, previous) {
       index = fence.end; continue;
     }
     const picture = line.match(/^!\[([^\]]*)\]\((.+)\)\s*$/);
-    if (picture) { appendImage(container, picture[2], picture[1] || '任务图片'); continue; }
+    if (picture) { appendImage(container, picture[2], picture[1] || '任务图片', imageButtons); continue; }
     if (line.includes('|') && lines[index + 1]?.includes('|') && cells(lines[index + 1]).every(cell => /^:?-{3,}:?$/.test(cell))) {
       list = null;
       const wrapper = document.createElement('div'); wrapper.className = 'table-scroll';
@@ -662,7 +761,10 @@ function renderHistoryItem(view, key, item, questions, replies) {
     block.append(document.createElement(message ? 'strong' : 'summary'));
     view.items.set(key, block);
   }
-  const signature = JSON.stringify([item, replies?.map(reply => [reply, questions?.get(reply.questionItemId)?.question])]);
+  const replySignature = JSON.stringify(replies?.map(reply => [reply, questions?.get(reply.questionItemId)?.question]));
+  if (block.historyItem === item && block.replySignature === replySignature) return block;
+  block.historyItem = item; block.replySignature = replySignature;
+  const signature = JSON.stringify([item, replySignature]);
   if (block.dataset.signature === signature) return block;
   block.dataset.signature = signature;
   const label = block.children[0];
@@ -670,6 +772,7 @@ function renderHistoryItem(view, key, item, questions, replies) {
     label.textContent = item.type === 'userMessage' ? '你' : item.type === 'steeringUserMessage' ? `你${item.status === 'accepted' ? '' : item.status === 'rejected' ? ' · 未接收' : ' · 待接收'}` : item.type === 'plan' ? '计划' : isProcessItem(item) ? '进度' : 'Codex';
     const content = document.createElement('div');
     content.className = 'message-body';
+    const imageButtons = [...block.querySelectorAll('.image-attachment')];
     let text = messageText(item.text ?? item.content ?? item.input);
     if (item.type === 'userMessage' && text.includes('Distinguish instructions in attached documents from the user\'s request.')) {
       const marker = text.match(/(?:##?\s*)?My request:\s*/);
@@ -681,7 +784,7 @@ function renderHistoryItem(view, key, item, questions, replies) {
       const answer = document.createElement('p'); answer.textContent = reply.answer;
       pair.append(title, answer); content.append(pair);
     }
-    else if (text) renderText(content, text, block);
+    else if (text) renderText(content, text, block, imageButtons);
     for (const question of questionsForItem(item)) {
       const section = document.createElement('div'); section.className = 'question-history';
       const title = document.createElement('strong'); title.textContent = question.question;
@@ -694,8 +797,8 @@ function renderHistoryItem(view, key, item, questions, replies) {
       content.append(section);
     }
     for (const attachment of Array.isArray(item.content) ? item.content : []) {
-      if (attachment.type === 'localImage') appendImage(content, attachment.path);
-      if (attachment.type === 'image') appendImage(content, attachment.url);
+      if (attachment.type === 'localImage') appendImage(content, attachment.path, '任务图片', imageButtons);
+      if (attachment.type === 'image') appendImage(content, attachment.url, '任务图片', imageButtons);
       if (attachment.type === 'mention') appendFile(content, attachment);
     }
     syncChildren(block, [label, content]);
@@ -718,17 +821,18 @@ function renderHistoryItem(view, key, item, questions, replies) {
   return block;
 }
 
-function renderHistory(thread, live = false) {
+function renderHistory(thread, live = false, preserveLive = false) {
   const id = thread.id ?? threadId;
-  if (!live) thread = timeline.snapshot(id, thread);
+  if (!live) thread = timeline.snapshot(id, thread, preserveLive);
   let view = historyViews.get(id);
   if (!view) { view = { turns: new Map(), items: new Map() }; historyViews.set(id, view); }
-  const blocks = [];
+  const blocks = [], usedTurns = new Set(), usedItems = new Set();
   const questionState = collectAsyncQuestions(thread, active[id]);
   const userMessageIds = new Set((thread.turns ?? []).flatMap(turn => turnItems(turn).filter(item => item.type === 'userMessage').map(item => item.id)));
   const userClientIds = new Set((thread.turns ?? []).flatMap(turn => turnItems(turn).filter(item => item.type === 'userMessage' && item.clientId).map(item => item.clientId)));
   for (const [index, turn] of (thread.turns ?? []).entries()) {
     const key = turn.id ?? `missing-${index}`;
+    usedTurns.add(key);
     let nodes = view.turns.get(key);
     if (!nodes) {
       const section = document.createElement('section'); section.className = 'turn'; section.dataset.turnId = key;
@@ -764,7 +868,9 @@ function renderHistory(thread, live = false) {
       if (!inserted && showProcess && (processItem || (!hasItems && item.type !== 'userMessage'))) {
         messages.push(nodes.process); inserted = true;
       }
-      const block = renderHistoryItem(view, JSON.stringify([key, item.id ?? itemIndex]), item, questionState.questions, replies);
+      const itemKey = JSON.stringify([key, item.id ?? itemIndex]);
+      usedItems.add(itemKey);
+      const block = renderHistoryItem(view, itemKey, item, questionState.questions, replies);
       (processItem ? processItems : messages).push(block);
     });
     if (showProcess && !inserted) messages.push(nodes.process);
@@ -775,13 +881,21 @@ function renderHistory(thread, live = false) {
   syncChildren($('history'), blocks);
   if (!blocks.length) $('history').textContent = '暂无历史消息';
   renderAsyncQuestions(thread);
+  for (const key of view.turns.keys()) if (!usedTurns.has(key)) view.turns.delete(key);
+  for (const key of view.items.keys()) if (!usedItems.has(key)) view.items.delete(key);
+  view.revision = timeline.revision(id);
+  view.active = active[id];
+  historyViews.delete(id); historyViews.set(id, view);
+  pruneHistory();
 }
 
 async function loadHistory(id) {
+  const epoch = connectionEpoch;
   if (paginatedHistory) return historyPages.read(id);
   const statusToken = pendingApprovals.token();
   const settingsVersion = modelSettingVersions.get(id) ?? 0;
   const result = await command('thread/resume', { threadId: id, excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } });
+  if (!connected || epoch !== connectionEpoch) throw Error('历史读取所属连接已失效');
   pendingApprovals.thread(id, result.thread?.status, statusToken);
   renderApprovals();
   rememberThreadStatus(id, result, settingsVersion);
@@ -789,11 +903,14 @@ async function loadHistory(id) {
   return { thread: { ...result.thread, turns: [...result.initialTurnsPage.data].reverse() } };
 }
 
-async function select(id) {
+async function select(id, preservedReading = null) {
   if (archiveStates.get(id)) throw Error('会话已归档，请先在已归档列表中恢复');
   if (archiveBusy || (uncertainSubmission && ['thread/archive', 'thread/unarchive'].includes(delivery.pending?.method))) throw Error('请先确认归档操作结果');
   if (sending || stopping || slashBusy) throw new Error('操作正在提交，请稍后切换任务');
   const request = ++selection;
+  const readingPosition = id === threadId ? preservedReading ?? captureReadingPosition() : null;
+  const epoch = connectionEpoch;
+  const valid = () => connected && epoch === connectionEpoch && request === selection && !archiveStates.get(id);
   selecting = true;
   selectingThread = id;
   if (id !== threadId) { asyncQuestionCards = []; renderQuestionDock(); }
@@ -807,20 +924,22 @@ async function select(id) {
       const visited = new Set();
       do {
         const page = await command('thread/list', { archived: false, limit: 100, ...(pageCursor ? { cursor: pageCursor } : {}) });
-        if (request !== selection || archiveStates.get(id)) return;
+        if (!valid()) return;
         if (page.data.some(task => task.id === id)) { archiveStates.set(id, false); break; }
         pageCursor = page.nextCursor;
         if (pageCursor && visited.has(pageCursor)) throw Error('会话列表分页未完成，请刷新后重试');
         visited.add(pageCursor);
       } while (pageCursor);
-      if (!archiveStates.has(id)) throw Error('此会话不在未归档列表中，请从已归档列表恢复后再打开');
+      if (!archiveStates.has(id)) throw Error('此会话未出现在普通列表中，可能是临时会话或已归档；待处理请求可从侧栏直接查看');
     }
-    if (request !== selection || archiveStates.get(id)) return;
+    if (!valid()) return;
     const statusToken = pendingApprovals.token();
     const settingsVersion = modelSettingVersions.get(id) ?? 0;
+    const historyRevision = timeline.revision(id);
     const result = freshThreads.has(id)
       ? { thread: freshThreads.get(id) }
       : await command('thread/resume', { threadId: id, excludeTurns: true, ...(!paginatedHistory ? { initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } : {}) });
+    if (!valid()) return;
     pendingApprovals.thread(id, result.thread?.status, statusToken);
     rememberThreadStatus(id, result, settingsVersion);
     if (!paginatedHistory && result.initialTurnsPage) result.thread.turns = [...result.initialTurnsPage.data].reverse();
@@ -828,9 +947,9 @@ async function select(id) {
       const page = await historyPages.read(id);
       result.thread.turns = page.thread.turns;
     }
-    if (request !== selection || archiveStates.get(id)) return;
+    if (!valid()) return;
     await syncThreadMode(id);
-    if (request !== selection || archiveStates.get(id)) return;
+    if (!valid()) return;
     const switched = threadId !== id;
     if (result.model && !defaultModels.has(id)) defaultModels.set(id, result.model);
     if (threadId) drafts.set(threadId, $('message').value);
@@ -843,7 +962,7 @@ async function select(id) {
     $('conversation-title').textContent = result.thread.name || result.thread.preview || '新会话';
     $('conversation-title').title = result.thread.name || result.thread.preview || id;
     $('current').textContent = `当前任务：${result.thread.name || id}`;
-    renderHistory(result.thread);
+    renderHistory(result.thread, false, historyRevision !== timeline.revision(id));
     $('older-history').hidden = !paginatedHistory || !historyPages.pages.get(id)?.cursor;
     $('conversation').open = true;
     log = '';
@@ -851,8 +970,14 @@ async function select(id) {
     renderApprovals();
     if (switched) followingLatest = true;
     scrollToLatest();
+  } catch (error) {
+    if (valid()) throw error;
   } finally {
-    if (request === selection) { selecting = false; selectingThread = ''; updateControls(); renderTasks(); }
+    if (request === selection) {
+      selecting = false; selectingThread = ''; updateControls(); renderTasks();
+      if (valid()) restoreReadingPosition(readingPosition);
+    }
+    pruneHistory();
   }
 }
 
@@ -860,12 +985,13 @@ async function syncThreadMode(id) {
   if (!threadModeReads) return;
   if (modeReads.has(id)) return modeReads.get(id);
   const token = planMode.token(id);
+  const epoch = connectionEpoch;
   const request = (async () => {
     try {
       const result = await api(`/api/thread-mode?threadId=${encodeURIComponent(id)}`);
-      planMode.acceptRead(id, result, token, active[id]);
+      if (connected && epoch === connectionEpoch) planMode.acceptRead(id, result, token, active[id]);
     } catch { /* A missing source does not block opening the task or imply execution mode. */ }
-    finally { modeReadAt.set(id, Date.now()); modeReads.delete(id); }
+    finally { if (epoch === connectionEpoch) { modeReadAt.set(id, Date.now()); modeReads.delete(id); } }
   })();
   modeReads.set(id, request);
   return request;
@@ -918,6 +1044,11 @@ function updateControls() {
   $('choose-task').disabled = $('workspace').hidden;
   $('compose-hint').textContent = selecting ? '正在切换会话…' : !threadId ? '选择会话，或输入 /new 新建' : '';
   $('model-label').textContent = pendingModelLabel(threadId);
+  const modelLabel = threadId ? `${connected ? '当前' : '最近同步'}：${modelSettingLabel(currentModelSetting(threadId))}` : '选择会话后查看模型';
+  $('current-model').textContent = modelLabel;
+  $('current-model').title = `${modelLabel}${pendingModelLabel(threadId) ? `；${pendingModelLabel(threadId)}` : ''}`;
+  $('current-model').disabled = !threadId || !!commandUnavailable('/model');
+  renderQuota();
   const knownMode = planMode.known.get(threadId), nextMode = planMode.choices.get(threadId);
   const displayMode = planMode.display(threadId);
   $('compose').dataset.collaborationMode = knownMode ?? 'unknown';
@@ -974,6 +1105,7 @@ function syncKeyboard() {
   document.documentElement.style.setProperty('--dock-height', `${Math.max(180, (viewport?.height || window.innerHeight || 800) - 84)}px`);
   document.body.classList.toggle('composing', inset > 80);
   resizeMessage();
+  positionQuickMenu();
   if (focused) requestAnimationFrame(() => {
     const bottom = (viewport?.height || window.innerHeight) + (viewport?.offsetTop || 0);
     const overflow = $('interaction-dock').getBoundingClientRect().bottom - bottom;
@@ -1098,8 +1230,60 @@ function modelSettingLabel(setting) {
   return `${setting?.model || '未知型号'} · ${effortLabel(setting?.effort) ?? '强度未知'}`;
 }
 function currentModelSetting(id) {
+  const runtime = modelSnapshots.get(id);
+  if (runtime) return { model: runtime.model ?? runtime.collaborationMode?.settings?.model ?? null, effort: runtime.effort ?? runtime.collaborationMode?.settings?.reasoning_effort ?? null };
   const status = taskStatus.get(id);
   return { model: status && Object.hasOwn(status, 'model') ? status.model : defaultModels.get(id), effort: status?.reasoningEffort };
+}
+function observeModelSettings(id, settings) {
+  const signature = JSON.stringify(settings);
+  if (JSON.stringify(modelSnapshots.get(id)) === signature) return;
+  modelSnapshots.set(id, settings);
+  modelSettingVersions.set(id, (modelSettingVersions.get(id) ?? 0) + 1);
+  const mode = settings.collaborationMode?.settings;
+  rememberThreadStatus(id, { model: settings.model ?? mode?.model ?? null, reasoningEffort: settings.effort ?? mode?.reasoning_effort ?? null });
+}
+
+function renderQuota() {
+  const summary = accountQuota.summary();
+  $('account-quota').textContent = summary;
+  $('account-quota').title = `${summary}；查看账号额度详情`;
+  $('account-quota').setAttribute('aria-label', `账号${summary.startsWith('账号') ? summary.slice(2) : summary}；查看详情`);
+  $('refresh-quota').disabled = quotaLoading || !connected;
+  $('quota-updated').textContent = accountQuota.receivedAt == null ? '尚无同步记录' : `同步于：${new Date(accountQuota.receivedAt).toLocaleString()}`;
+  $('quota-scope').textContent = accountQuota.queriedAt == null ? '账号额度未完整同步，请重新查询。' : `账号接口查询结果 · 查询于 ${new Date(accountQuota.queriedAt).toLocaleString()}`;
+  $('quota-status').textContent = quotaLoading ? '正在查询账号额度…' : accountQuota.error || (!connected ? '连接中断，显示的额度是旧值；恢复连接后请重新查询账号。' : !quotaReadable ? '当前连接仅支持额度通知。桌面下次正常启动后，才能读取账号额度明细。' : accountQuota.isStale() ? '数据可能已过期，请重新读取；旧值不能代表当前余额。' : '可重新查询账号额度；同一分钟内复用最近查询。');
+  if (!$('quota-dialog').open) return;
+  $('quota-ordinary').textContent = accountQuota.result?.ordinaryUsageAllowed === false ? '普通包含额度：当前不允许使用。重置时间或剩余比例不代表已恢复。' : accountQuota.result?.ordinaryUsageAllowed === true ? '普通包含额度：当前允许使用。' : '普通包含额度可用状态：服务未提供。';
+  const sections = (accountQuota.queriedAt != null && accountQuota.account ? [accountQuota.account] : []).map(bucket => {
+    const section = document.createElement('section'), heading = document.createElement('strong');
+    heading.textContent = '账号周期额度'; section.append(heading);
+    for (const window of bucket.windows) {
+      const row = document.createElement('p');
+      row.textContent = `${quotaPeriod(window.minutes)} · ${window.remaining == null ? '剩余比例未提供' : `剩余 ${window.remaining}%`}`;
+      const reset = document.createElement('p'); reset.className = 'small muted';
+      reset.textContent = window.resetsAt == null ? '重置时间未提供' : `重置：${new Date(window.resetsAt).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
+      section.append(row, reset);
+    }
+    if (!bucket.windows.length) section.append(document.createTextNode(' · 周期额度未提供'));
+    return section;
+  });
+  $('quota-details').replaceChildren(...sections);
+  if (!sections.length) $('quota-details').textContent = '账号主额度未提供。';
+}
+
+async function readQuota() {
+  if (quotaLoading || !connected) return;
+  if (!quotaReadable) { await poll(); renderQuota(); return; }
+  quotaLoading = true; quotaReadAt = Date.now();
+  const token = accountQuota.startRead();
+  renderQuota();
+  try {
+    const value = await api('/api/account-rate-limits');
+    if (connected && (!value.bridgeId || value.bridgeId === bridgeId)) accountQuota.acceptRead(value, token);
+  } catch (error) {
+    if (token.epoch === accountQuota.epoch) { accountQuota.error = error.message; accountQuota.stale = true; }
+  } finally { accountQuota.finishRead(token); quotaLoading = false; renderQuota(); }
 }
 function rememberThreadStatus(id, result, version = modelSettingVersions.get(id) ?? 0) {
   const previous = taskStatus.get(id) ?? {}, next = { ...previous, ...result };
@@ -1358,7 +1542,7 @@ function statusRows() {
   return [
     ['审批策略', show(status.approvalPolicy)], ['授权审核', show(status.approvalsReviewer)],
     ['权限模式', show(status.activePermissionProfile?.id ?? status.sandbox?.type)],
-    ['当前推理强度（最近同步）', show(effortLabel(status.reasoningEffort))],
+    ['当前推理强度（最近同步）', show(effortLabel(currentModelSetting(threadId).effort))],
     ['本轮上下文 Token', show(status.tokenUsage?.last?.totalTokens)],
     ['上下文窗口', show(status.tokenUsage?.modelContextWindow)],
     ['历史加载', paginatedHistory ? '分页加载，可查看更早消息' : '最近 10 轮；桥接更新后可加载更早消息'],
@@ -1455,6 +1639,15 @@ function locateApproval() {
   card.focus({ preventScroll: true });
 }
 
+function openPendingRequests(id) {
+  pendingThread = id;
+  $('pending-dialog-status').textContent = '';
+  $('pending-dialog-thread').textContent = threads.get(id)?.name || threads.get(id)?.preview || (id ? `会话 ${id}` : '未归属请求');
+  $('task-dialog').close();
+  $('pending-dialog').showModal();
+  renderApprovals();
+}
+
 function renderApprovalReminders() {
   const entries = pendingApprovals.entries();
   const current = entries.get(threadId);
@@ -1480,20 +1673,16 @@ function renderApprovalReminders() {
       title.textContent = threads.get(entry.id)?.name || threads.get(entry.id)?.preview || (entry.id ? `会话 ${entry.id}` : '未归属请求 · 请在桌面核对');
       const status = document.createElement('span'); status.textContent = approvalLabel(entry);
       button.append(title, status);
-      button.disabled = busy || !connected || !entry.id;
-      button.onclick = async () => {
-        try {
-          if (entry.id !== threadId) await select(entry.id);
-          $('task-dialog').close();
-          locateApproval();
-        } catch (error) { $('pending-error').textContent = `无法打开会话，请在桌面核对：${error.message}`; }
-      };
+      button.onclick = () => openPendingRequests(entry.id);
       return button;
     }));
   }
   for (const article of approvalCards.values()) {
-    for (const control of article.querySelectorAll('button, input, select')) control.disabled = !connected || selecting || article.dataset.responding === 'true';
-    article.questionControls?.setLocked(!connected || selecting || article.dataset.responding === 'true');
+    if (article.capabilityNotice) article.capabilityNotice.hidden = mcpUrlElicitation;
+    const locked = !connected || selecting || article.dataset.responding === 'true' ||
+      (article.dataset.urlMode === 'true' && !mcpUrlElicitation);
+    for (const control of article.querySelectorAll('button, input, select')) control.disabled = locked;
+    article.questionControls?.setLocked(locked);
   }
   updateAsyncControls();
   $('jump-approvals').hidden = !current && !asyncCount;
@@ -1504,12 +1693,13 @@ function renderApprovals() {
   const requests = pendingApprovals.requests;
   const retained = new Set(requests.map(request => JSON.stringify(request)));
   for (const key of approvalCards.keys()) if (!retained.has(key)) approvalCards.delete(key);
-  const relevant = requests.filter(r => r.params?.threadId === threadId);
+  const relevant = requests.filter(r => r.params?.threadId === threadId || (pendingThread !== null && (r.params?.threadId ?? '') === pendingThread));
   const pending = pendingApprovals.get(threadId);
   $('jump-approvals').hidden = !pending;
   $('jump-approvals').textContent = approvalLabel(pending);
   renderApprovalReminders();
-  const signature = JSON.stringify([threadId, relevant, pending?.desktop, pending?.uncertain]);
+  const panelPending = pendingThread === null ? null : pendingApprovals.get(pendingThread);
+  const signature = JSON.stringify([threadId, pendingThread, relevant, pending?.desktop, pending?.uncertain, panelPending?.desktop, panelPending?.uncertain, mcpUrlElicitation]);
   if (signature === approvalSignature) return;
   approvalSignature = signature;
   const cards = [];
@@ -1520,16 +1710,42 @@ function renderApprovals() {
     article.className = 'approval-card';
     article.tabIndex = -1;
     article.dataset.requestId = String(request.id);
+    article.dataset.threadId = request.params?.threadId ?? '';
     const heading = document.createElement('h2');
     const isQuestion = request.method === 'item/tool/requestUserInput';
+    const isMcp = request.method === mcpApprovalMethod;
+    const isUrl = isMcpUrlElicitation(request);
+    const meta = request.params?._meta ?? {};
     article.dataset.question = String(isQuestion);
-    heading.textContent = !isAnswerable(request) ? '需在桌面处理' : isQuestion ? '需要你的回答' : request.method === 'item/fileChange/requestApproval' ? '允许修改文件？' : '允许执行命令？';
+    article.dataset.urlMode = String(isUrl);
+    heading.textContent = !isAnswerable(request) ? '需在桌面处理' : isUrl ? '前往外部授权页？' : isMcp ? '允许 MCP 授权？' : isQuestion ? '需要你的回答' : request.method === 'item/fileChange/requestApproval' ? '允许修改文件？' : '允许执行命令？';
     article.append(heading);
-    for (const [label, value] of [['原因', request.params.reason], ['工作目录', request.params.cwd], ['命令', request.params.command], ['申请写入目录', request.params.grantRoot]]) {
-      if (!value) continue;
+    const fields = isMcp
+      ? [['请求', request.params.message], ['服务', [meta._codex_apps?.connector_auth_failure?.connector_name ?? meta.connector_name, request.params.serverName].filter(Boolean).join(' · ')],
+        ['授权页来源', isUrl ? new URL(request.params.url).origin : null], ['完整授权网址', request.params.mode === 'url' ? request.params.url : null],
+        ['目标来源', meta.origin], ['访问范围', meta.full_cdp_access === true ? '完整 Chrome DevTools 访问（完整 CDP 权限）' : meta.full_cdp_access],
+        ['风险等级', meta.riskLevel === 'high' ? '高风险（high）' : meta.riskLevel], ['授权持续方式', meta.persist]]
+      : [['原因', request.params.reason], ['工作目录', request.params.cwd], ['命令', request.params.command], ['申请写入目录', request.params.grantRoot]];
+    for (const [label, value] of fields) {
+      if (value == null || value === '') continue;
+      if (isMcp) {
+        const text = document.createElement('p'); text.className = 'mcp-approval-field';
+        const caption = document.createElement('strong'); caption.textContent = `${label}：`;
+        text.append(caption, document.createTextNode(typeof value === 'string' ? value : JSON.stringify(value)));
+        article.append(text);
+        continue;
+      }
       const caption = document.createElement('strong'); caption.textContent = label;
       const text = document.createElement('pre'); text.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
       article.append(caption, text);
+    }
+    if (isMcp) {
+      const scope = document.createElement('p');
+      scope.textContent = isUrl ? '打开只表示你同意前往此网址。请在新页面自行完成授权；此处不会确认连接是否完成。'
+        : meta.persist === 'always'
+        ? '此请求要求持续授权（always）：允许后将记住该授权。请核对上面的目标与访问范围。'
+        : '允许将按原请求的范围和持续方式授权；请核对完整请求。';
+      article.append(scope);
     }
     if (!isQuestion) {
       if (request.params.grantRoot) {
@@ -1543,17 +1759,49 @@ function renderApprovals() {
       detail.append(summary, raw); article.append(detail);
     }
     const feedback = document.createElement('p'); feedback.setAttribute('role', 'status');
+    const capability = document.createElement('p'); capability.className = 'small muted';
+    if (isUrl) {
+      capability.textContent = '当前桌面桥接尚不支持此授权回复。请在桌面下次正常启动并加载新版桥接后处理；现在仍可查看请求。';
+      capability.hidden = mcpUrlElicitation;
+      article.capabilityNotice = capability;
+      article.append(capability);
+    }
     let responding = false;
+    let urlOpened = false;
     const respond = async result => {
-      if (responding || !connected || selecting || threadId !== request.params.threadId || !pendingApprovals.requests.some(current => JSON.stringify(current) === key)) return;
+      if (responding || !connected || selecting || (isUrl && !mcpUrlElicitation) ||
+          !pendingApprovals.requests.some(current => JSON.stringify(current) === key)) return;
+      if (isUrl && result.action === 'accept' && !urlOpened) {
+        // A blank popup lets us detect blocking. Isolate it before any external navigation.
+        let popup;
+        try {
+          popup = window.open('about:blank', '_blank');
+          if (!popup) throw Error('浏览器阻止了新页面');
+          popup.opener = null;
+          const link = popup.document.createElement('a');
+          link.href = request.params.url; link.rel = 'noopener noreferrer'; link.target = '_self';
+          popup.document.body.append(link); link.click();
+          urlOpened = true;
+        } catch (error) {
+          popup?.close();
+          feedback.textContent = `未打开授权页：${error.message}。允许弹出窗口后可重试；尚未提交回复。`;
+          return;
+        }
+      }
       responding = true;
       article.dataset.responding = 'true';
       const controls = [...article.querySelectorAll('button, input, select')];
       controls.forEach(control => { control.disabled = true; });
       feedback.textContent = '正在提交…';
-      try { await api('/api/answer', { id: request.id, result }); feedback.textContent = '已提交，等待任务继续。'; }
+      try {
+        await api('/api/answer', { id: request.id, result });
+        feedback.textContent = isUrl && result.action === 'accept'
+          ? '已提交同意前往的回复。请在授权页自行完成操作；连接是否完成尚未确认。' : '已提交，等待任务继续。';
+        if (pendingThread === (request.params?.threadId ?? '')) $('pending-dialog-status').textContent = feedback.textContent;
+      }
       catch (error) {
-        feedback.textContent = `提交未确认：${error.message}。请等待状态刷新后核对。`;
+        feedback.textContent = `提交未确认：${error.message}。请等待状态刷新后核对，再手动重试。${urlOpened ? '授权页已打开，重试只提交回复。' : ''}`;
+        if (urlOpened) article.querySelector('[data-action="accept"]').textContent = '重试提交同意前往';
         responding = false;
         article.dataset.responding = 'false';
         renderApprovalReminders();
@@ -1564,6 +1812,16 @@ function renderApprovals() {
     } else if (isQuestion) {
       article.questionControls = questionCard(request.params.questions ?? [], respond);
       article.append(article.questionControls.form);
+    } else if (isMcp) {
+      const actions = document.createElement('div'); actions.className = 'mcp-approval-actions';
+      for (const [text, action] of [[isUrl ? '打开授权页' : meta.persist === 'always' ? '允许并记住授权' : '允许此授权', 'accept'], ['拒绝', 'decline'], ['取消', 'cancel']]) {
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = text;
+        button.dataset.action = action;
+        button.className = action === 'accept' ? '' : 'secondary';
+        button.onclick = () => respond(action === 'accept' && !isUrl ? { action, content: {} } : { action });
+        actions.append(button);
+      }
+      article.append(actions);
     } else {
       for (const [text, decision] of [['允许这一次', 'accept'], ['拒绝', 'decline']]) {
         const button = document.createElement('button');
@@ -1578,17 +1836,19 @@ function renderApprovals() {
     approvalCards.set(key, article);
     cards.push(article);
   }
-  if (pending?.desktop.length) {
+  for (const [id, entry] of new Map([[threadId, pending], ...(pendingThread !== null ? [[pendingThread, panelPending]] : [])])) if (entry?.desktop.length) {
     const card = document.createElement('article'); card.className = 'approval-card'; card.tabIndex = -1;
+    card.dataset.threadId = id;
     const heading = document.createElement('h2'); heading.textContent = '需在桌面处理';
     const detail = document.createElement('p');
-    detail.textContent = pending.uncertain ? '上次检测到此会话在等待处理，当前状态待同步。请在桌面 Codex 核对。' : `${pending.desktop.includes('waitingOnApproval') ? '此会话正在等待批准' : '此会话正在等待回答'}。手机尚未收到可操作的请求，请在桌面 Codex 处理。`;
+    detail.textContent = entry.uncertain ? '上次检测到此会话在等待处理，当前状态待同步。请在桌面 Codex 核对。' : `${entry.desktop.includes('waitingOnApproval') ? '此会话正在等待批准' : '此会话正在等待回答'}。手机尚未收到可操作的请求，请在桌面 Codex 处理。`;
     card.append(heading, detail); cards.push(card);
   }
   // Removing a sibling request must not detach the form the user is typing in.
-  for (const [id, question] of [['approvals', false], ['questions', true]]) {
+  for (const [id, question] of [['pending-dialog-cards', null], ['approvals', false], ['questions', true]]) {
     const container = $(id);
-    const entries = cards.filter(card => (card.dataset.question === 'true') === question);
+    const entries = cards.filter(card => question === null ? card.dataset.threadId === pendingThread
+      : card.dataset.threadId === threadId && card.dataset.threadId !== pendingThread && (card.dataset.question === 'true') === question);
     if (question) { syncQuestionCards = entries; renderQuestionDock(); continue; }
     for (const card of [...container.children]) if (!entries.includes(card)) card.remove();
     entries.forEach((card, index) => {
@@ -1596,20 +1856,32 @@ function renderApprovals() {
     });
     if (question) container.hidden = !entries.length;
   }
+  if (pendingThread !== null && !$('pending-dialog-cards').children.length && !$('pending-dialog-status').textContent) {
+    $('pending-dialog-status').textContent = '此请求已处理或已失效。';
+  }
   syncKeyboard();
   renderApprovalReminders();
 }
 
 async function poll() {
-  if (polling) return;
+  if (polling || accessEnded) return;
   polling = true;
   let stateReceived = false;
+  let reconnectReading = null;
   try {
     const state = await api(`/api/state?after=${cursor}`);
+    if (accessEnded) return;
+    // Capture before status/approval DOM updates can move the native scroll anchor.
+    if (!connected && state.ready) {
+      reconnectReading = captureReadingPosition();
+      beginReadingRestore(reconnectReading);
+    }
     stateReceived = true;
     $('workspace').hidden = false;
     $('connection-error').textContent = '';
     connected = state.ready;
+    quotaReadable = !!state.capabilities?.accountRateLimits;
+    mcpUrlElicitation = !!state.capabilities?.mcpUrlElicitation;
     paginatedHistory = !!state.capabilities?.paginatedHistory;
     taskCommands = !!state.capabilities?.taskCommands;
     taskArchive = !!state.capabilities?.taskArchive;
@@ -1618,7 +1890,17 @@ async function poll() {
     $('mode').textContent = state.mode === 'desktop-shared' ? '桌面共享连接 · 手机关闭后任务继续运行' : state.mode === 'standalone' ? '独立服务 · 此连接不控制桌面任务' : 'Web 已连接，等待桌面桥接；无需重启 Web。';
     const changed = bridgeId && state.bridgeId && state.bridgeId !== bridgeId;
     if (state.bridgeId) bridgeId = state.bridgeId;
+    if (changed || (state.reset && state.cursor > accountQuota.cursor)) { accountQuota.clear(); quotaReadAt = 0; }
+    if (changed || state.reset) modelSnapshots.clear();
+    for (const event of state.events ?? []) {
+      if (event.method === 'account/updated' && event.cursor > accountQuota.cursor) quotaReadAt = 0;
+      if (['account/updated', 'account/rateLimits/updated'].includes(event.method)) accountQuota.event(event);
+    }
+    if (!connected) accountQuota.disconnect();
+    if (connected && quotaReadable && Date.now() - quotaReadAt > 60000) void readQuota();
+    for (const [id, settings] of Object.entries(state.threadSettings ?? {})) observeModelSettings(id, settings);
     if (!connected || changed || (state.reset && state.cursor !== cursor)) {
+      invalidateConnectionReads();
       tasksLoaded = false; archiveRevision++;
       // Missed events invalidate active membership, never infer an archived task is active.
       for (const [id, archived] of archiveStates) if (!archived) archiveStates.delete(id);
@@ -1637,41 +1919,54 @@ async function poll() {
     renderApprovals();
     updateControls();
     const created = delivery.createdNaming;
-    if (created && !freshThreads.has(created.threadId)) freshThreads.set(created.threadId, { id: created.threadId, cwd: created.cwd, projectId: created.projectId, turns: [] });
-    if (connected) await recoverSubmission();
+    if (created && restoreCreatedNaming && !freshThreads.has(created.threadId)) freshThreads.set(created.threadId, { id: created.threadId, cwd: created.cwd, projectId: created.projectId, turns: [] });
+    if (connected) void sessionLoader.run('recovery', recoverSubmission).catch(showError);
     if (connected && restoreCreatedNaming && !delivery.pending && !creating && !slashBusy) {
       restoreCreatedNaming = false;
-      const saved = delivery.createdNaming;
-      if (saved) {
-        if ($('new-dialog').open) $('new-dialog').close();
-        try { await select(saved.threadId); }
-        catch (error) { showError(new Error(`会话已创建，请在列表中打开：${error.message}`)); }
-        openCommandForm('/rename', saved.name, saved.threadId, true);
-        $('command-hint').textContent = '此会话已创建。保存名称即可继续，不会重复创建会话。';
-      }
+      const namingEpoch = connectionEpoch;
+      void sessionLoader.run('created-naming', async () => {
+        const saved = delivery.createdNaming;
+        if (saved) {
+          if ($('new-dialog').open) $('new-dialog').close();
+          try { await select(saved.threadId); }
+          catch (error) { showError(new Error(`会话已创建，请在列表中打开：${error.message}`)); }
+          if (!connected || namingEpoch !== connectionEpoch) return;
+          openCommandForm('/rename', saved.name, saved.threadId, true);
+          $('command-hint').textContent = '此会话已创建。保存名称即可继续，不会重复创建会话。';
+        }
+      }).catch(showError);
     }
     const hydrating = connected && !tasksLoaded && !sending && !stopping && !selecting && !archiveBusy;
     if (hydrating) {
-      await list();
-      tasksLoaded = true;
-      const previous = sessionStorage.getItem('codex-thread');
-      if (previous) {
-        try { await select(previous); }
-        catch (error) {
-          // Keep the draft and healthy connection; let the user choose or create a task.
-          if (taskArchive && threadId === previous && !archiveStates.has(previous)) {
-            drafts.set(previous, $('message').value); threadId = ''; $('message').value = '';
-            selection++; selecting = false; selectingThread = '';
-            sessionStorage.removeItem('codex-thread');
-            $('conversation-title').textContent = 'Codex'; $('conversation-title').title = '';
-            $('current').textContent = '请选择会话'; $('history').textContent = '请重新选择会话，草稿已保留。';
-            $('older-history').hidden = true;
+      const hydrationRevision = archiveRevision;
+      void sessionLoader.run('hydrate', async () => {
+        await sessionLoader.pending.get('created-naming');
+        if (hydrationRevision !== archiveRevision || !connected) return;
+        const hydrationSelection = selection;
+        await list();
+        if (hydrationRevision !== archiveRevision || !connected) return;
+        tasksLoaded = true;
+        if (hydrationSelection !== selection) return;
+        const previous = sessionStorage.getItem('codex-thread');
+        if (previous) {
+          try { await select(previous, reconnectReading); }
+          catch (error) {
+            // Keep the draft and healthy connection; let the user choose or create a task.
+            if (taskArchive && threadId === previous && !archiveStates.has(previous)) {
+              drafts.set(previous, $('message').value); threadId = ''; $('message').value = '';
+              selection++; selecting = false; selectingThread = '';
+              sessionStorage.removeItem('codex-thread');
+              $('conversation-title').textContent = 'Codex'; $('conversation-title').title = '';
+              $('current').textContent = '请选择会话'; $('history').textContent = '请重新选择会话，草稿已保留。';
+              $('older-history').hidden = true;
+            }
+            showError(new Error(`无法恢复上次会话，请在会话列表中重新选择：${error.message}`));
           }
-          showError(new Error(`无法恢复上次会话，请在会话列表中重新选择：${error.message}`));
         }
-      }
+      }).catch(showError).finally(() => finishReadingRestore(reconnectReading));
     }
     const selected = selection;
+    const readEpoch = connectionEpoch;
     const currentThread = threadId;
     let refreshHistory = (state.reset || changed || needsHistoryRefresh) && !!currentThread;
     for (const event of state.events) {
@@ -1682,8 +1977,7 @@ async function poll() {
         const id = event.params.threadId, settings = event.params.threadSettings;
         if (settings) {
           if (Object.hasOwn(settings, 'collaborationMode')) planMode.observe(id, settings.collaborationMode);
-          modelSettingVersions.set(id, (modelSettingVersions.get(id) ?? 0) + 1);
-          rememberThreadStatus(id, { model: settings.model ?? null, reasoningEffort: settings.effort ?? null });
+          observeModelSettings(id, settings);
           if ($('model-dialog').open && $('model-dialog').dataset.threadId === id && id === threadId) {
             renderModelCurrent();
             if (modelCatalog && !modelLoading && !modelDraftChanged && !modelOverrides.has(id)) { $('model-error').textContent = ''; renderModelChoices(currentModelSetting(id)); }
@@ -1691,7 +1985,7 @@ async function poll() {
         }
       }
       if (event.params?.threadId !== currentThread) continue;
-      if (!hydrating) timeline.event(event);
+      timeline.event(event);
       if (event.method === 'thread/tokenUsage/updated') taskStatus.set(currentThread, { ...taskStatus.get(currentThread), tokenUsage: event.params.tokenUsage });
       if (event.method === 'turn/started' ||
           (['item/started', 'item/completed'].includes(event.method) && event.params.item?.type === 'userMessage')) {
@@ -1703,31 +1997,33 @@ async function poll() {
         refreshHistory = true;
       }
     }
-    if (refreshHistory && !archiveStates.get(currentThread) && selected === selection) {
-      try {
-        const result = await loadHistory(currentThread);
-        // A read belongs to the selection that initiated it, even if the same task is reopened.
-        if (selected !== selection) return;
-        renderHistory(result.thread);
-        $('older-history').hidden = !paginatedHistory || !historyPages.pages.get(currentThread)?.cursor;
-      } catch (error) {
-        if (selected !== selection) return;
-        showError(new Error(`会话历史暂时无法加载，请重新选择会话重试：${error.message}`));
-      }
-      // A stale task must not block the connection cursor or pending approvals.
+    if (refreshHistory && hydrating) needsHistoryRefresh = true;
+    if (connected && refreshHistory && !hydrating && !archiveStates.get(currentThread) && selected === selection) {
       needsHistoryRefresh = false;
+      sessionLoader.history({
+        load: () => loadHistory(currentThread), revision: () => timeline.revision(currentThread),
+        valid: () => connected && readEpoch === connectionEpoch && selected === selection && currentThread === threadId && !archiveStates.get(currentThread),
+        commit: result => {
+          renderHistory(result.thread);
+          $('older-history').hidden = !paginatedHistory || !historyPages.pages.get(currentThread)?.cursor;
+        },
+        error: error => showError(new Error(`会话历史暂时无法加载，请重新选择会话重试：${error.message}`)),
+      });
     }
-    if (currentThread && selected === selection) renderHistory(timeline.thread(currentThread), true);
+    if (currentThread && selected === selection) renderLiveHistory(currentThread);
     if (connected && currentThread && selected === selection && !selecting && !sending && !modeReads.has(currentThread) &&
         ((state.events ?? []).some(event => event.params?.threadId === currentThread && ['turn/started', 'turn/completed'].includes(event.method)) || Date.now() - (modeReadAt.get(currentThread) ?? 0) > 15000)) {
-      await syncThreadMode(currentThread);
+      void syncThreadMode(currentThread).catch(showError);
     }
     cursor = state.cursor;
+    pruneHistory();
     updateControls();
     if (followingLatest) scrollToLatest();
   } catch (error) {
     if (!stateReceived) {
       connected = false;
+      invalidateConnectionReads();
+      accountQuota.disconnect();
       archiveRevision++;
       for (const [id, archived] of archiveStates) if (!archived) archiveStates.delete(id);
       pendingApprovals.disconnect();
@@ -1740,6 +2036,8 @@ async function poll() {
     polling = false;
     updateControls();
     $('reconcile').hidden = !uncertainSubmission;
+    if (connected) restoreReadingPosition(reconnectReading);
+    if (!sessionLoader.pending.has('hydrate')) finishReadingRestore(reconnectReading);
   }
 }
 
@@ -1748,6 +2046,10 @@ async function connect() {
 }
 
 $('refresh').onclick = () => list().catch(showError);
+$('current-model').onclick = () => openModelPicker();
+$('account-quota').onclick = () => { $('quota-dialog').showModal(); renderQuota(); };
+$('close-quota').onclick = () => $('quota-dialog').close();
+$('refresh-quota').onclick = () => readQuota();
 $('more').onclick = () => list(true).catch(showError);
 $('choose-task').onclick = () => {
   renderTasks();
@@ -1774,6 +2076,24 @@ $('slash-toggle').onclick = () => {
   showSlashMenu(true);
 };
 // Keep focus from moving the toolbar between touch release and the resulting click.
+function positionQuickMenu() {
+  const menu = $('quick-menu');
+  if (menu.hidden) return;
+  const viewport = window.visualViewport;
+  const header = document.querySelector('.app-header');
+  const left = (viewport?.offsetLeft ?? 0) + 8;
+  const top = Math.max(viewport?.offsetTop ?? 0, header?.getBoundingClientRect().bottom ?? 0) + 8;
+  const width = viewport?.width ?? window.innerWidth;
+  const height = viewport?.height ?? window.innerHeight;
+  const anchor = $('message').getBoundingClientRect();
+  const available = anchor.top - top - 8;
+  const bottom = (viewport?.offsetTop ?? 0) + height - 8;
+  menu.style.maxHeight = `${Math.min(360, bottom - top, Math.max(76, available))}px`;
+  const bounds = menu.getBoundingClientRect();
+  const toggle = $('quick-toggle').getBoundingClientRect();
+  menu.style.setProperty('--quick-left', `${Math.max(left, Math.min(toggle.left, left + width - 16 - bounds.width))}px`);
+  menu.style.setProperty('--quick-top', `${Math.max(top, Math.min(anchor.top - 8 - bounds.height, bottom - bounds.height))}px`);
+}
 $('quick-toggle').addEventListener('pointerdown', event => event.preventDefault());
 $('quick-toggle').onclick = () => {
   const open = $('quick-menu').hidden;
@@ -1782,7 +2102,7 @@ $('quick-toggle').onclick = () => {
   $('quick-toggle').setAttribute('aria-expanded', String(open));
   $('slash-menu').hidden = true; $('slash-toggle').setAttribute('aria-expanded', 'false');
   (open ? $('quick-menu').querySelector('button') : $('quick-toggle')).focus({ preventScroll: true });
-  if (open) $('quick-menu').scrollIntoView({ block: 'nearest', behavior: 'instant' });
+  if (open) positionQuickMenu();
 };
 $('quick-menu').addEventListener('click', event => {
   const button = event.target.closest('button[data-message]');
@@ -1804,6 +2124,8 @@ document.addEventListener('keydown', event => {
 $('jump-approvals').onclick = locateApproval;
 $('open-current-approval').onclick = locateApproval;
 $('close-tasks').onclick = () => $('task-dialog').close();
+$('close-pending').onclick = () => $('pending-dialog').close();
+$('pending-dialog').onclose = () => { pendingThread = null; renderApprovals(); $('choose-task').focus({ preventScroll: true }); };
 $('task-search').oninput = renderTasks;
 $('archive-confirm').onclick = submitArchive;
 $('archive-cancel').onclick = () => $('archive-dialog').close();
@@ -1917,7 +2239,7 @@ $('new-form').onsubmit = async event => {
   finally { creating = false; updateControls(); }
 };
 $('logout').onclick = async () => {
-  try { await api('/api/logout', {}); $('workspace').hidden = true; location.replace('/login'); }
+  try { await api('/api/logout', {}); leaveForLogin(); }
   catch (error) { showError(error); }
 };
 $('reconcile').onclick = () => {
@@ -2000,10 +2322,10 @@ $('stop').onclick = async () => {
   } catch (error) { showError(error); }
   finally { stopping = false; updateControls(); }
 };
-window.addEventListener('pagehide', () => { $('workspace').hidden = true; });
-window.addEventListener('pageshow', event => { if (event.persisted) { tasksLoaded = false; poll(); } });
+window.addEventListener('pagehide', () => { accessEnded = true; $('workspace').hidden = true; for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close(); });
+window.addEventListener('pageshow', event => { if (event.persisted) { accessEnded = false; tasksLoaded = false; poll(); } });
 window.addEventListener('online', () => poll());
-window.addEventListener('offline', () => { connected = false; tasksLoaded = false; $('status').textContent = '连接中断 · 等待网络'; updateControls(); });
+window.addEventListener('offline', onOffline);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { tasksLoaded = false; poll(); } });
 connect().catch(error => { $('connection-error').textContent = error.message; });
 while (true) {

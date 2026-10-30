@@ -1,3 +1,4 @@
+import { trimSessions } from './session-loader.js';
 const keyFor = (turnId, itemId) => JSON.stringify([turnId ?? '', itemId]);
 const sameUserMessage = (a, b) => a.type === 'userMessage' && b.type === 'userMessage' &&
   JSON.stringify(a.content) === JSON.stringify(b.content) &&
@@ -80,7 +81,15 @@ export function processSummary(turn, running = false) {
 }
 
 export class Timeline {
-  constructor() { this.histories = new Map(); this.live = new Map(); this.turnMetadata = new Map(); this.observedTurns = new Map(); }
+  constructor() { this.histories = new Map(); this.live = new Map(); this.turnMetadata = new Map(); this.observedTurns = new Map(); this.revisions = new Map(); }
+  revision(id) { return this.revisions.get(id) ?? 0; }
+  changed(id) { this.revisions.set(id, this.revision(id) + 1); }
+  prune(protectedIds = new Set()) {
+    const sessions = new Map([...this.histories, ...this.live, ...this.turnMetadata]);
+    trimSessions(sessions, protectedIds, 6, id => {
+      for (const map of [this.histories, this.live, this.turnMetadata, this.observedTurns, this.revisions]) map.delete(id);
+    });
+  }
   metadata(id, turns) {
     const metadata = this.turnMetadata.get(id) ?? new Map();
     this.turnMetadata.set(id, metadata);
@@ -93,16 +102,20 @@ export class Timeline {
       for (const field of ['startedAt', 'completedAt', 'durationMs']) {
         if (incoming[field] === null && previous[field] != null) delete incoming[field];
       }
-      metadata.set(turn.id, { ...previous, ...incoming });
+      const merged = { ...previous, ...incoming };
+      metadata.set(turn.id, merged);
+      if (JSON.stringify(previous) !== JSON.stringify(merged)) this.changed(id);
     }
   }
-  snapshot(id, thread) {
+  snapshot(id, thread, preserveLive = false) {
     this.metadata(id, thread.turns ?? []);
     const previous = this.histories.get(id);
+    const previousItems = new Map((previous?.turns ?? []).map(turn => [turn.id, new Map((turn.items ?? []).map(item => [item.id, item]))]));
     thread = { ...thread, turns: (thread.turns ?? []).map(turn => ({ ...turn, items: (turn.items ?? []).map(item =>
-      preserveQuestionMetadata(previous?.turns?.find(old => old.id === turn.id)?.items?.find(old => old.id === item.id), item)) })) };
+      preserveQuestionMetadata(previousItems.get(turn.id)?.get(item.id), item)) })) };
     this.histories.set(id, thread);
-    return this.thread(id, true);
+    this.changed(id);
+    return this.thread(id, !preserveLive);
   }
   event(event) {
     const p = event.params ?? {};
@@ -118,7 +131,7 @@ export class Timeline {
     if (['item/started', 'item/completed'].includes(event.method) && p.item?.id) {
       const key = keyFor(p.turnId, p.item.id);
       const historical = this.histories.get(p.threadId)?.turns?.find(turn => turn.id === p.turnId)?.items?.find(item => item.id === p.item.id);
-      live.set(key, { turnId: p.turnId ?? '', item: preserveQuestionMetadata(live.get(key)?.item ?? historical, p.item) }); return;
+      live.set(key, { turnId: p.turnId ?? '', item: preserveQuestionMetadata(live.get(key)?.item ?? historical, p.item) }); this.changed(p.threadId); return;
     }
     if (!p.itemId || typeof p.delta !== 'string') return;
     const type = event.method === 'item/agentMessage/delta' ? 'agentMessage'
@@ -130,6 +143,7 @@ export class Timeline {
     const field = type === 'agentMessage' ? 'text' : 'aggregatedOutput';
     item[field] = (item[field] ?? '') + p.delta;
     live.set(key, { turnId: p.turnId ?? '', item });
+    this.changed(p.threadId);
   }
   thread(id, consume = false) {
     const history = this.histories.get(id) ?? { id, turns: [] };

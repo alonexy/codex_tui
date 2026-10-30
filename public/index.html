@@ -30,6 +30,10 @@
           <p id="plan-mode-label" class="muted small" role="status"></p>
         </div>
         <div id="plan-mode-menu" role="group" aria-label="下轮模式" hidden><button id="plan-mode-default" type="button" class="secondary" aria-pressed="false">执行</button><button id="plan-mode-plan" type="button" class="secondary" aria-pressed="false">计划</button></div>
+        <div class="composer-account-bar" aria-label="模型与账号额度">
+          <button id="current-model" type="button" class="secondary" aria-controls="model-dialog">模型未同步</button>
+          <button id="account-quota" type="button" class="secondary" aria-controls="quota-dialog">额度未提供</button>
+        </div>
         <div class="composer-box">
         <div id="quick-menu" role="group" aria-labelledby="quick-title" hidden>
           <div class="quick-heading"><strong id="quick-title">快捷指令</strong><span>点击立即发送</span></div>
@@ -66,7 +70,8 @@
     <p id="connection-error" class="error" role="alert"></p>
     <dialog id="task-dialog" aria-labelledby="task-title">
       <div class="dialog-heading"><h2 id="task-title">会话</h2><button id="close-tasks" type="button" class="secondary" autofocus>关闭</button></div>
-      <p id="mode" class="small muted"></p><div class="toolbar"><button id="refresh" class="secondary">刷新任务</button><button id="logout" class="secondary">锁定并退出</button></div>
+      <p id="mode" class="small muted"></p><div class="toolbar"><button id="refresh" class="secondary">刷新任务</button><button id="logout" class="secondary">退出登录</button></div>
+      <button id="manage-passkeys" type="button" class="secondary wide">通行密钥（Face ID）</button>
       <button id="manage-devices" type="button" class="secondary wide">登录设备与安全记录</button>
       <section id="pending-tasks" aria-labelledby="pending-title" hidden><h3 id="pending-title">待处理</h3><p class="small muted">包含其他项目、筛选外及未加载的会话</p><div id="pending-task-list"></div><p id="pending-error" class="error" role="status"></p></section>
       <label for="task-search">搜索任务</label><input id="task-search" type="search" placeholder="标题、内容或任务 ID">
@@ -78,11 +83,28 @@
       <button id="more" type="button" class="secondary wide" hidden>加载更多任务</button>
       <p id="search-scope" class="muted small">项目与桌面项目配置同步。输入可筛选已加载任务，也可搜索历史标题。</p>
     </dialog>
+    <dialog id="pending-dialog" aria-labelledby="pending-dialog-title">
+      <div class="dialog-heading"><h2 id="pending-dialog-title">待处理请求</h2><button id="close-pending" type="button" class="secondary" autofocus>关闭</button></div>
+      <p id="pending-dialog-thread" class="small muted"></p>
+      <p class="small muted">查看和处理此请求不会切换当前会话。</p>
+      <div id="pending-dialog-cards"></div>
+      <p id="pending-dialog-status" role="status"></p>
+    </dialog>
     <dialog id="archive-dialog" aria-labelledby="archive-title">
       <h2 id="archive-title">归档会话</h2><p id="archive-target"></p>
       <p id="archive-hint" class="muted small">归档后可在“已归档”列表中恢复。未发送的草稿将保留在当前页面。</p>
       <p id="archive-error" class="error" role="alert"></p>
       <div class="toolbar"><button id="archive-confirm" type="button">确认归档</button><button id="archive-cancel" type="button" class="secondary" autofocus>取消</button><button id="archive-receipt" type="button" class="secondary" hidden>查询操作结果</button></div>
+    </dialog>
+    <dialog id="quota-dialog" aria-labelledby="quota-title">
+      <div class="dialog-heading"><h2 id="quota-title">账号额度</h2><button id="close-quota" type="button" class="secondary" autofocus>关闭</button></div>
+      <p class="small muted">各周期分别计算剩余额度，服务未提供的额度无法推算。</p>
+      <p id="quota-scope" class="small"></p>
+      <p id="quota-ordinary" class="small"></p>
+      <div id="quota-details"></div>
+      <p id="quota-updated" class="small muted"></p>
+      <p id="quota-status" class="small" role="status"></p>
+      <button id="refresh-quota" type="button" class="secondary">重新读取</button>
     </dialog>
     <dialog id="model-dialog" aria-labelledby="model-title" aria-describedby="model-hint">
       <form id="model-form">

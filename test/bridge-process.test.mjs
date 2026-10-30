@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, access } from 'node:fs/promises';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { localRequest } from '../src/local-ipc.mjs';
@@ -12,6 +12,10 @@ async function fixture(t) {
   const native = join(state, 'native.mjs');
   await writeFile(native, `#!${process.execPath}
 import { createInterface } from 'node:readline';
+if (process.argv.includes('--print-startup-config')) {
+  console.log(JSON.stringify({appServerVersion:'0.160.0',configRequirements:{requirements:{application:{network:null}}},client:JSON.parse(process.argv[process.argv.indexOf('--startup-client-info')+1]),signedOut:process.argv.includes('--startup-sign-out')}));
+  process.exit(0);
+}
 createInterface({input:process.stdin}).on('line', line => {
   const m=JSON.parse(line);
   if (m.id === undefined) return;
@@ -36,7 +40,7 @@ createInterface({input:process.stdin}).on('line', line => {
     await rm(state, { recursive: true, force: true });
   });
   const socket = join(state, 'ipc', 'bridge.sock');
-  function launch(name) {
+  function launch(name, initializeId = 'init') {
     const p = spawn(process.execPath, ['src/bridge.mjs', 'app-server'], {
       env: { ...process.env, CODEX_REAL_CLI: native, CODEX_PHONE_STATE_DIR: state, CODEX_PHONE_SOCKET: socket },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -63,10 +67,10 @@ createInterface({input:process.stdin}).on('line', line => {
     });
     return {
       rpc,
-      initialize: () => rpc('init', 'initialize', { clientInfo: { name } }),
+      initialize: () => rpc(initializeId, 'initialize', { clientInfo: { name } }),
       initializeWithQueuedRead() {
         p.stdin.cork();
-        const initialized = rpc('init', 'initialize', { clientInfo: { name } });
+        const initialized = rpc(initializeId, 'initialize', { clientInfo: { name } });
         p.stdin.write(JSON.stringify({ method: 'initialized' }) + '\n');
         const policy = rpc('queued-read', 'configRequirements/read');
         p.stdin.uncork();
@@ -79,7 +83,44 @@ createInterface({input:process.stdin}).on('line', line => {
       },
     };
   }
-  return { launch, socket };
+  function startup(signOut = false) {
+    return new Promise((resolve, reject) => {
+      const client = { name: 'codex_desktop', title: 'Codex Desktop', version: '26.1025' };
+      const p = spawn(process.execPath, ['src/bridge.mjs', 'app-server', '--print-startup-config', '--startup-client-info', JSON.stringify(client), ...(signOut ? ['--startup-sign-out'] : [])], {
+        env: { ...process.env, CODEX_REAL_CLI: native, CODEX_PHONE_STATE_DIR: state, CODEX_PHONE_SOCKET: socket },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      children.push(p);
+      let stdout = '', stderr = '';
+      p.stdout.on('data', chunk => { stdout += chunk; });
+      p.stderr.on('data', chunk => { stderr += chunk; });
+      p.on('error', reject);
+      p.on('close', code => resolve({ code, stdout, stderr }));
+    });
+  }
+  return { launch, socket, startup };
+}
+
+for (const signOut of [false, true]) {
+  test(`desktop startup config passes through with stdin closed (sign out: ${signOut})`, { timeout: 10000 }, async t => {
+    const { launch, socket, startup } = await fixture(t);
+    const check = async () => {
+      const result = await startup(signOut);
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        appServerVersion: '0.160.0',
+        configRequirements: { requirements: { application: { network: null } } },
+        client: { name: 'codex_desktop', title: 'Codex Desktop', version: '26.1025' },
+        signedOut: signOut,
+      });
+    };
+    await check();
+    await assert.rejects(access(socket), { code: 'ENOENT' });
+    await launch('codex_desktop').initialize();
+    const before = await localRequest(socket, '/status');
+    await check();
+    assert.equal((await localRequest(socket, '/status')).bridgeId, before.bridgeId);
+  });
 }
 
 test('browser policy helpers coexist with the desktop bridge and preserve policy errors', async t => {
@@ -118,4 +159,28 @@ test('a second desktop still cannot take over the shared socket', async t => {
   const before = await localRequest(socket, '/status');
   await assert.rejects(launch('codex_desktop').initialize(), /本机服务已运行/);
   assert.equal((await localRequest(socket, '/status')).bridgeId, before.bridgeId);
+});
+
+test('desktop network preflight does not claim a bridge socket', async t => {
+  const { launch, socket } = await fixture(t);
+  const client = launch('codex_desktop', 'network-initialize');
+  const [init, policy] = await client.initializeWithQueuedRead();
+  assert.equal(init.result.client, 'codex_desktop');
+  assert.equal(policy.result.requirements.application.browser.access, 'deny');
+  await assert.rejects(access(socket), { code: 'ENOENT' });
+  assert.deepEqual(await client.rpc('config', 'config/read'), {
+    id: 'config', error: { code: -32000, message: 'policy unavailable' },
+  });
+  assert.equal((await client.close())[0], 0);
+});
+
+test('desktop network preflight coexists with an initialized desktop', async t => {
+  const { launch, socket } = await fixture(t);
+  await launch('codex_desktop').initialize();
+  const before = await localRequest(socket, '/status');
+  const helper = launch('codex_desktop', 'network-initialize');
+  assert.equal((await helper.initialize()).result.client, 'codex_desktop');
+  assert.equal((await helper.rpc('requirements', 'configRequirements/read')).result.requirements.application.browser.access, 'deny');
+  assert.equal((await localRequest(socket, '/status')).bridgeId, before.bridgeId);
+  assert.equal((await helper.close())[0], 0);
 });

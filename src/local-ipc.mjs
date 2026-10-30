@@ -12,7 +12,7 @@ export function localRequest(socketPath, path, data) {
       response.on('end', () => {
         try {
           const value = JSON.parse(body);
-          if (response.statusCode !== 200) throw new Error(value.error ?? '本机接口错误');
+          if (response.statusCode !== 200) throw Object.assign(new Error(value.error ?? '本机接口错误'), value.submission === 'rejected' ? { submission: 'rejected' } : {});
           resolve(value);
         } catch (error) { reject(error); }
       });
@@ -48,7 +48,7 @@ export async function listenLocal(socketPath, handle) {
       res.end(JSON.stringify(result ?? null));
     } catch (error) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: error.message }));
+      res.end(JSON.stringify({ error: error.message, ...(error.submission === 'rejected' ? { submission: 'rejected' } : {}) }));
     }
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });

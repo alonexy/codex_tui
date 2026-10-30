@@ -53,7 +53,10 @@ try {
     }
     await route.fulfill({ body: JSON.stringify(data), contentType: 'application/json' });
   });
-  const openSidebar = async () => { if (!(await page.locator('#task-dialog').evaluate(element => element.open))) await page.locator('#choose-task').click(); };
+  const openSidebar = async () => {
+    if (await page.locator('#pending-dialog').evaluate(element => element.open)) await page.locator('#close-pending').click();
+    if (!(await page.locator('#task-dialog').evaluate(element => element.open))) await page.locator('#choose-task').click();
+  };
   const pending = id => page.locator(`.pending-task[data-pending-thread="${id}"]`);
   const choosePending = async id => { await openSidebar(); await pending(id).click(); await page.waitForFunction(() => !document.querySelector('#task-dialog').open); };
   const card = id => page.locator(`.approval-card[data-request-id="${id}"]`);
@@ -111,8 +114,8 @@ try {
   await pending('two').click();
   await page.waitForFunction(() => !document.querySelector('#task-dialog').open);
   assert.equal(await card('files').count(), 1);
-  assert.equal(await page.locator('#message').inputValue(), '');
-  assert.equal(await page.locator('#image-previews img').count(), 0);
+  assert.equal(await page.locator('#message').inputValue(), '保留当前消息草稿');
+  assert.equal(await page.locator('#image-previews img').count(), 1);
   await choosePending('one');
   assert.equal(await card('question').locator('input').inputValue(), '保留尚未提交的回答');
   assert.equal(await page.locator('#message').inputValue(), '保留当前消息草稿');
@@ -126,6 +129,7 @@ try {
   assert.equal(await card('question').locator('input').inputValue(), '保留尚未提交的回答');
   assert.equal(await card('question').locator('input').evaluate(element => document.activeElement === element), true);
   assert.match(await page.locator('#approval-reminder').innerText(), /^1 项待回答/);
+  await page.locator('#close-pending').click();
   networkDown = true;
   await page.waitForFunction(() => document.querySelector('#status').textContent.includes('连接中断'));
   assert.match(await page.locator('#approval-reminder').innerText(), /待核对/);
@@ -139,7 +143,8 @@ try {
   networkDown = false;
   await page.waitForFunction(() => document.querySelector('#status').textContent === '已连接');
   await page.waitForFunction(() => !document.querySelector('#send').disabled);
-  assert.ok(Math.abs(await page.evaluate(() => scrollY) - reconnectY) < 3, 'reconnecting the current thread must preserve approval reading position');
+  const reconnectPosition = await page.evaluate(() => ({ y: scrollY, height: document.documentElement.scrollHeight, viewport: innerHeight, questionY: document.querySelector('#questions').getBoundingClientRect().y }));
+  assert.ok(Math.abs(reconnectPosition.y - reconnectY) < 3, `reconnecting the current thread must preserve approval reading position: before=${reconnectY}, after=${JSON.stringify(reconnectPosition)}`);
   assert.equal(await page.locator('#connection-error').textContent(), '', 'only the recovered connection error is cleared');
   assert.equal(await page.locator('#error').textContent(), '尚未解决的其他操作错误');
   await page.evaluate(() => { document.querySelector('#error').textContent = ''; });
@@ -152,23 +157,22 @@ try {
   emit(waiting('one', []), { method: 'serverRequest/resolved', params: { threadId: 'one', requestId: 'question' } });
   await page.locator('#approval-reminder').waitFor({ state: 'hidden' });
   await choosePending('unloaded');
-  await page.waitForFunction(() => document.querySelector('#compose-hint').textContent === '');
-  assert.match(await page.locator('#approvals').innerText(), /需在桌面处理/);
-  assert.equal(await page.locator('#approvals button').count(), 0);
+  assert.match(await page.locator('#pending-dialog-cards').innerText(), /需在桌面处理/);
+  assert.equal(await page.locator('#pending-dialog-cards button').count(), 0);
   assert.equal(await page.locator('#open-current-approval').isDisabled(), false);
   await page.screenshot({ path: `${artifacts}/desktop-only-390.png`, animations: 'disabled' });
   approvals.push(request('unknown-permission', 'unloaded', 'item/permissions/requestApproval'));
   await card('unknown-permission').waitFor();
-  assert.match(await page.locator('#approval-reminder').innerText(), /需在桌面处理/);
+  assert.match(await page.locator('#pending-dialog-cards').innerText(), /需在桌面处理/);
   assert.equal(await card('unknown-permission').locator('button').count(), 0, 'unknown requests cannot expose an invented acceptance result');
   approvals = approvals.filter(item => item.id !== 'unknown-permission');
   emit(waiting('unloaded', []));
-  await page.locator('#approval-reminder').waitFor({ state: 'hidden' });
+  await card('unknown-permission').waitFor({ state: 'detached' });
 
   // A ready=false snapshot is also a disconnect, never proof of desktop approval.
   await choosePending('two');
   ready = false;
-  await page.waitForFunction(() => document.querySelector('#approval-reminder-text').textContent.includes('待核对'));
+  await page.waitForFunction(() => document.querySelector('#pending-title').textContent.includes('待核对'));
   assert.equal(await card('files').getByRole('button', { name: '允许这一次' }).isDisabled(), true);
   ready = true; bridgeId = 'mock-two'; approvals = []; reset = true; emit(waiting('two', []));
   await card('files').waitFor({ state: 'detached' });

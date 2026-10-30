@@ -1,8 +1,8 @@
 # Codex 手机 Web 控制台与项目协作配置
 
-手机控制台实现位于 `src/` 与 `public/`，使用 Node.js 22+，无第三方依赖。
+手机控制台实现位于 `src/` 与 `public/`，使用 Node.js 22+；首次启动或依赖更新后执行 `npm ci`。通行密钥认证使用 SimpleWebAuthn。
 支持独立服务及桌面 stdio 桥接。首次加载桥接需要重启桌面；之后 `npm run web:restart` 可独立重启页面服务，任务继续运行。尚待真实桌面验收。
-启动步骤、认证与限制见 [手机 Web 控制台](docs/remote-control.md)。测试运行 `npm test`。
+启动步骤、认证与限制见 [手机 Web 控制台](docs/remote-control.md)。测试运行 `npm test`；隔离浏览器组合回归运行 `npm run test:browser`（需 Playwright 与本机 Chrome）。当前证据见 [验收记录](docs/mobile-acceptance.md)。
 
 以下为项目原有协作约定。
 

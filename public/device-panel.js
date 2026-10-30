@@ -1,4 +1,4 @@
-const actions = { login: '登录', logout: '退出登录', 'session.revoke': '撤销设备', 'session.revoke_all': '撤销全部设备', 'rpc.submit': '控制指令提交', 'approval.answer': '审批或回答提交' };
+const actions = { login: '登录', logout: '退出登录', 'session.revoke': '撤销设备', 'session.revoke_all': '撤销全部设备', 'rpc.submit': '控制指令提交', 'approval.answer': '审批或回答提交', 'passkey.register': '绑定通行密钥', 'passkey.login': '通行密钥登录', 'passkey.remove': '删除通行密钥' };
 const results = { success: '成功', failed: '失败', limited: '已限流', accepted: '已接收', revoked: '已撤销', missing: '设备已失效', denied: '已拒绝' };
 const date = value => Number.isFinite(value) ? new Date(value).toLocaleString() : '未知';
 

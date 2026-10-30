@@ -6,14 +6,17 @@ import { resolve } from 'node:path';
 import { Broker } from './broker.mjs';
 import { serveBridge } from './bridge-api.mjs';
 import { serviceConfig } from './service-config.mjs';
+import { resolveCodexCli } from './codex-cli.mjs';
 
 const args = process.argv.slice(2);
 const standalone = args[0] === '--standalone';
-const executable = process.env.CODEX_REAL_CLI ?? '/Applications/ChatGPT.app/Contents/Resources/codex';
+let executable;
+try { executable = resolveCodexCli(); }
+catch (error) { console.error(error.message); process.exit(1); }
 const subcommands = ['daemon', 'proxy', 'generate-ts', 'generate-json-schema', 'help'];
-const passthrough = !args.includes('app-server') || args.some(arg => ['--help', '-h', '--version'].includes(arg))
+const passthrough = !args.includes('app-server') || args.some(arg => ['--help', '-h', '--version', '--print-startup-config'].includes(arg))
   || args.slice(args.indexOf('app-server') + 1).some(arg => subcommands.includes(arg));
-// Browser/Computer Use start their own config/policy App Servers through CODEX_CLI_PATH.
+// Browser/Computer Use and desktop network preflight start their own policy App Servers.
 // Identify that client before claiming the desktop socket. Keep the same iterator
 // for subsequent lines so coalesced initialize/notification messages are retained.
 const desktopInput = !standalone && !passthrough ? createInterface({ input: process.stdin }) : null;
@@ -24,8 +27,10 @@ let nativeHelper = false;
 if (firstLine) {
   try {
     const message = JSON.parse(firstLine.value);
+    const name = message.params?.clientInfo?.name;
     nativeHelper = message.method === 'initialize'
-      && ['codex-browser-use', 'codex-computer-use'].includes(message.params?.clientInfo?.name);
+      && (['codex-browser-use', 'codex-computer-use'].includes(name)
+        || (name === 'codex_desktop' && message.id === 'network-initialize'));
   } catch { /* Invalid desktop JSON is reported by the normal protocol handler. */ }
 }
 // The desktop also invokes the CLI for non-server commands. Preserve those calls.

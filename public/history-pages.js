@@ -1,24 +1,48 @@
 // Pages are fetched newest-first, then displayed in chronological order.
+import { trimSessions } from './session-loader.js';
 export class HistoryPages {
-  constructor(command, onMetadata = () => {}) {
+  constructor(command, onMetadata = () => {}, protectedIds = () => new Set()) {
     this.command = command; this.onMetadata = onMetadata;
     this.pages = new Map(); this.pending = new Map();
     this.metadata = new Map(); this.metadataPending = new Map();
     this.metadataQueued = new Set();
+    this.protectedIds = protectedIds;
+    this.epoch = 0;
+  }
+  invalidate() {
+    this.epoch++;
+    for (const cache of [this.pages, this.pending, this.metadata, this.metadataPending, this.metadataQueued]) cache.clear();
+  }
+  check(epoch) {
+    if (epoch !== this.epoch) throw Error('历史读取所属连接已失效');
+  }
+  prune(protectedIds = this.protectedIds()) {
+    const protectedReads = new Set([...protectedIds, ...this.pending.keys(), ...this.metadataPending.keys()]);
+    trimSessions(this.pages, protectedReads, 6, id => {
+      this.pages.delete(id); this.metadata.delete(id); this.metadataQueued.delete(id);
+    });
   }
   read(threadId, older = false) {
-    const request = (this.pending.get(threadId) ?? Promise.resolve()).catch(() => {}).then(() => this.load(threadId, older));
+    const epoch = this.epoch;
+    const request = (this.pending.get(threadId) ?? Promise.resolve()).catch(() => {}).then(() => {
+      this.check(epoch); return this.load(threadId, older, epoch);
+    });
     this.pending.set(threadId, request);
-    request.finally(() => { if (this.pending.get(threadId) === request) this.pending.delete(threadId); }).catch(() => {});
+    request.finally(() => {
+      if (this.pending.get(threadId) === request) this.pending.delete(threadId);
+      this.prune();
+    }).catch(() => {});
     return request;
   }
-  async load(threadId, older) {
+  async load(threadId, older, epoch = this.epoch) {
+    this.check(epoch);
     const previous = this.pages.get(threadId);
     if (older && !previous?.cursor) return previous;
     const response = await this.command('thread/items/list', {
       threadId, limit: 100, sortDirection: 'desc',
       ...(older ? { cursor: previous.cursor } : {}),
     });
+    this.check(epoch);
     const incoming = [...response.data].reverse();
     const anchor = !older && incoming.length && previous ? previous.entries.findIndex(entry => entry.turnId === incoming[0].turnId && entry.item.id === incoming[0].item.id) : -1;
     const entries = older ? [...incoming, ...previous.entries] : anchor >= 0 ? [...previous.entries.slice(0, anchor), ...incoming] : incoming;
@@ -28,17 +52,17 @@ export class HistoryPages {
       if (seen.has(key)) return false;
       seen.add(key); return true;
     });
-    const turns = [];
+    const turns = [], byId = new Map();
     for (const entry of unique) {
-      let turn = turns.find(turn => turn.id === entry.turnId);
+      let turn = byId.get(entry.turnId);
       if (!turn) {
         turn = { ...this.metadata.get(threadId)?.get(entry.turnId), id: entry.turnId, items: [], itemsView: 'partial' };
-        turns.push(turn);
+        turns.push(turn); byId.set(entry.turnId, turn);
       }
       turn.items.push(entry.item);
     }
     const result = { entries: unique, cursor: anchor >= 0 ? previous.cursor : response.nextCursor, thread: { id: threadId, turns } };
-    this.pages.set(threadId, result);
+    this.pages.delete(threadId); this.pages.set(threadId, result);
     // Supplementary timing/status must never delay or fail a successful item page.
     this.refreshMetadata(threadId);
     return result;
@@ -46,12 +70,15 @@ export class HistoryPages {
   refreshMetadata(threadId) {
     if (this.metadataPending.has(threadId)) { this.metadataQueued.add(threadId); return; }
     const request = this.loadMetadata(threadId).catch(() => {}).finally(() => {
+      if (this.metadataPending.get(threadId) !== request) return;
       this.metadataPending.delete(threadId);
       if (this.metadataQueued.delete(threadId)) this.refreshMetadata(threadId);
+      this.prune();
     });
     this.metadataPending.set(threadId, request);
   }
   async loadMetadata(threadId) {
+    const epoch = this.epoch;
     const cache = this.metadata.get(threadId) ?? new Map();
     this.metadata.set(threadId, cache);
     const needed = new Set(this.pages.get(threadId).thread.turns
@@ -64,6 +91,7 @@ export class HistoryPages {
       const response = await this.command('thread/turns/list', {
         threadId, limit: 50, sortDirection: 'desc', itemsView: 'notLoaded', ...(cursor ? { cursor } : {}),
       });
+      this.check(epoch);
       const loaded = [];
       for (const { items, itemsView, ...metadata } of response.data ?? []) {
         if (!needed.delete(metadata.id)) continue;

@@ -55,33 +55,46 @@ export function createAuth(password, origin, now = Date.now, { allowLanHttp = fa
     createdAt: session.createdAt, lastSeen: session.lastSeen, expiresAt: session.expires,
     idleExpiresAt: Math.min(session.expires, session.lastSeen + idle), current,
   });
+  async function verifyPassword(value, source = 'local') {
+    if (typeof value !== 'string' || Buffer.byteLength(value) > 1024) return { status: 401, error: '密码不正确，请重新输入' };
+    const time = now();
+    for (const [key, times] of attempts) {
+      const recent = times.filter(at => at > time - windowMs);
+      if (recent.length) attempts.set(key, recent);
+      else attempts.delete(key);
+    }
+    const recent = attempts.get(source) ?? [];
+    if (recent.length >= 5) return { status: 429, error: '此来源尝试过于频繁，请稍后再试', retryAfter: Math.max(1, Math.ceil((recent[0] + windowMs - time) / 1000)) };
+    // Bound expensive work and source bookkeeping without a global minute-long lockout.
+    if (verifying >= 2 || (!attempts.has(source) && attempts.size >= 1024)) return { status: 429, error: '登录服务繁忙，请稍后再试', retryAfter: 1 };
+    recent.push(time);
+    attempts.set(source, recent);
+    verifying++;
+    let valid;
+    try { valid = timingSafeEqual(await derive(value, salt, 32), expected); }
+    finally { verifying--; }
+    if (!valid) return { status: 401, error: '密码不正确，请重新输入' };
+    return { status: 200 };
+  }
+  function issueSession(source, userAgent, previousRequest, credentialId = null) {
+    prune();
+    if (previousRequest) sessions.delete(sessionId(previousRequest));
+    if (sessions.size >= 100) sessions.delete(sessions.keys().next().value);
+    const id = randomBytes(32).toString('hex');
+    const createdAt = now();
+    const session = { publicId: randomUUID(), device: deviceName(userAgent), source, createdAt, expires: createdAt + lifetime, lastSeen: createdAt, credentialId };
+    sessions.set(id, session);
+    return { status: 200, cookie: cookie(id, lifetime / 1000), session: describe(session, true) };
+  }
   return {
-    async login(value, source = 'local', userAgent = '') {
-      if (typeof value !== 'string' || Buffer.byteLength(value) > 1024) return { status: 401, error: '密码不正确，请重新输入' };
-      const time = now();
-      for (const [key, times] of attempts) {
-        const recent = times.filter(at => at > time - windowMs);
-        if (recent.length) attempts.set(key, recent);
-        else attempts.delete(key);
-      }
-      const recent = attempts.get(source) ?? [];
-      if (recent.length >= 5) return { status: 429, error: '此来源尝试过于频繁，请稍后再试', retryAfter: Math.max(1, Math.ceil((recent[0] + windowMs - time) / 1000)) };
-      // Bound expensive work and source bookkeeping without a global minute-long lockout.
-      if (verifying >= 2 || (!attempts.has(source) && attempts.size >= 1024)) return { status: 429, error: '登录服务繁忙，请稍后再试', retryAfter: 1 };
-      recent.push(time);
-      attempts.set(source, recent);
-      verifying++;
-      let valid;
-      try { valid = timingSafeEqual(await derive(value, salt, 32), expected); }
-      finally { verifying--; }
-      if (!valid) return { status: 401, error: '密码不正确，请重新输入' };
-      prune();
-      if (sessions.size >= 100) sessions.delete(sessions.keys().next().value);
-      const id = randomBytes(32).toString('hex');
-      const createdAt = now();
-      const session = { publicId: randomUUID(), device: deviceName(userAgent), source, createdAt, expires: createdAt + lifetime, lastSeen: createdAt };
-      sessions.set(id, session);
-      return { status: 200, cookie: cookie(id, lifetime / 1000), session: describe(session, true) };
+    verifyPassword,
+    issuePasskeySession(req, credentialId, source, userAgent) { return issueSession(source, userAgent, req, credentialId); },
+    revokeCredential(credentialId) {
+      for (const [id, session] of sessions) if (session.credentialId === credentialId) sessions.delete(id);
+    },
+    async login(value, source = 'local', userAgent = '', previousRequest) {
+      const result = await verifyPassword(value, source);
+      return result.status === 200 ? issueSession(source, userAgent, previousRequest) : result;
     },
     authenticated(req) {
       const session = sessionFor(req);
@@ -109,7 +122,8 @@ export function createAuth(password, origin, now = Date.now, { allowLanHttp = fa
       return { revoked: false, current: false };
     },
     revokeAll(req) {
-      if (!sessionFor(req)) throw new Error('请先验证访问密码');
+      const current = sessionFor(req);
+      if (!current) throw new Error('请先验证访问密码');
       const revoked = sessions.size;
       sessions.clear();
       return { revoked, current: true };

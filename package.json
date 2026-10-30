@@ -2,9 +2,12 @@
   "name": "codex-phone-bridge",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build:mermaid": "node scripts/build-mermaid.mjs",
+    "build:webauthn": "node scripts/build-webauthn.mjs",
     "desktop": "node scripts/start-desktop.mjs",
     "web": "node scripts/web-service.mjs start",
     "web:restart": "node scripts/web-service.mjs restart",
@@ -12,10 +15,15 @@
     "web:status": "node scripts/web-service.mjs status",
     "start": "node src/bridge.mjs --standalone",
     "test": "node --test test/*.test.mjs",
-    "test:mobile": "node scripts/mobile-smoke.mjs"
+    "test:mobile": "node scripts/mobile-smoke.mjs",
+    "test:browser": "node scripts/browser-regression.mjs"
   },
   "devDependencies": {
     "esbuild": "0.25.12",
     "mermaid": "11.17.2"
+  },
+  "dependencies": {
+    "@simplewebauthn/browser": "14.0.0",
+    "@simplewebauthn/server": "14.0.3"
   }
 }

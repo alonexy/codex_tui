@@ -17,7 +17,7 @@ function stop() {
 try {
   if (statSync(config.passwordPath).mode & 0o077) throw new Error('密码文件权限必须为 600');
   const password = readFileSync(config.passwordPath, 'utf8').trim();
-  web = createWebServer(connectBridge(config.bridgeSocket), { password, origin: config.origin, allowLanHttp: config.allowLanHttp, additionalOrigins: config.additionalOrigins, allowHttpOrigins: config.allowHttpOrigins, trustedProxyAddresses: config.trustedProxyAddresses, auditPath: join(config.state, 'security-audit.jsonl') });
+  web = createWebServer(connectBridge(config.bridgeSocket), { password, origin: config.origin, allowLanHttp: config.allowLanHttp, additionalOrigins: config.additionalOrigins, allowHttpOrigins: config.allowHttpOrigins, trustedProxyAddresses: config.trustedProxyAddresses, auditPath: join(config.state, 'security-audit.jsonl'), passkeyPath: join(config.state, 'passkeys.json') });
   await new Promise((resolve, reject) => { web.once('error', reject); web.listen(config.port, '0.0.0.0', resolve); });
   const instanceId = randomUUID();
   control = await listenLocal(config.webSocket, (method, path) => {

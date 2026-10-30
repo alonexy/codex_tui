@@ -3,6 +3,7 @@ const password = document.getElementById('password');
 const button = document.getElementById('login-submit');
 const error = document.getElementById('login-error');
 const toggle = document.getElementById('show-password');
+let stopPasskey = () => {};
 try { sessionStorage.removeItem('codex-token'); } catch { /* Storage access is not required for login. */ }
 if (location.search || location.hash) history.replaceState(null, '', '/login');
 toggle.onclick = () => {
@@ -14,6 +15,7 @@ toggle.onclick = () => {
 form.onsubmit = async event => {
   event.preventDefault();
   if (button.disabled) return;
+  stopPasskey();
   button.disabled = true;
   button.textContent = '正在验证…';
   error.textContent = '';
@@ -37,3 +39,9 @@ form.onsubmit = async event => {
 };
 error.textContent = '';
 button.disabled = false;
+
+// Optional module failure on older Web processes cannot disable password login.
+import('./passkey-client.js').then(({ passkeyLogin }) => passkeyLogin({ onPasswordSubmit: stop => { stopPasskey = stop; } })).catch(() => {
+  document.getElementById('passkey-login-hint').textContent = '通行密钥暂不可用，可继续使用访问密码。';
+});
+window.addEventListener('pagehide', () => { password.value = ''; });

@@ -2,7 +2,7 @@ import { closeSync, constants, fchmodSync, fstatSync, ftruncateSync, mkdirSync, 
 import { dirname } from 'node:path';
 import { isIP } from 'node:net';
 
-const actions = new Set(['login', 'logout', 'session.revoke', 'session.revoke_all', 'rpc.submit', 'approval.answer']);
+const actions = new Set(['login', 'logout', 'session.revoke', 'session.revoke_all', 'rpc.submit', 'approval.answer', 'passkey.register', 'passkey.login', 'passkey.remove']);
 const results = new Set(['success', 'failed', 'limited', 'accepted', 'revoked', 'missing', 'denied']);
 const publicId = value => typeof value === 'string' && /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(value) ? value : null;
 const device = value => typeof value === 'string' && /^(Edge|Firefox|Chrome|Safari|其他浏览器) · (iOS|Android|Windows|macOS|Linux|未知系统)$/.test(value) ? value : '其他浏览器 · 未知系统';
@@ -80,7 +80,7 @@ export function createAudit({ path, now = Date.now, maxEvents = 300, maxBytes = 
       if (time - windowStart >= 60000 || time < windowStart) {
         windowStart = time; ordinary = 0; critical = 0; recent.clear();
       }
-      const isNoise = event.result === 'denied' || (event.action === 'login' && event.result !== 'success');
+      const isNoise = event.result === 'denied' || (['login', 'passkey.login'].includes(event.action) && event.result !== 'success');
       const key = `${event.source}|${event.action}|${event.result}`;
       if ((isNoise && time - (recent.get(key) ?? -Infinity) < 10000) || (isNoise ? ordinary >= 180 : critical >= 60)) {
         suppressed = Math.min(Number.MAX_SAFE_INTEGER, suppressed + 1); return false;

@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { HistoryPages } from '../public/history-pages.js';
+import { SessionLoader, trimSessions } from '../public/session-loader.js';
 import { Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary } from '../public/timeline.js';
 import { DeliveryState, deliveryLabel } from '../public/delivery-state.js';
 import { taskPreferences } from '../public/task-preferences.js';
-import { ApprovalState, approvalLabel, isAnswerable } from '../public/approval-state.js';
+import { ApprovalState, approvalLabel, isAnswerable, mcpApprovalMethod } from '../public/approval-state.js';
 import { formatBytes } from '../public/attachment-policy.js';
 import { PlanMode, modeLabel } from '../public/plan-mode.js';
+import { AccountQuota, quotaPeriod } from '../public/account-quota.js';
 import { fencedBlock } from '../public/mermaid.js';
 import { questionsForItem, replyForItem, parseQuestionReply, serializeQuestionReply, collectAsyncQuestions } from '../public/async-questions.js';
 
@@ -61,9 +63,11 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
     cancelAnimationFrame() {}, requestAnimationFrame() {},
     composerMedia: () => ({ render() {}, reading: () => false, hasImages: () => false, input: async () => [], capture: () => ({ threadId: 'thread-1', items: [] }), clear() {} }),
     HistoryPages,
+    SessionLoader, trimSessions,
+    AccountQuota, quotaPeriod,
     Timeline, turnItems, isProcessItem, processAction, operationFailed, processSummary,
     DeliveryState, deliveryLabel, devicePanel: () => {},
-    ApprovalState, approvalLabel, isAnswerable,
+    ApprovalState, approvalLabel, isAnswerable, mcpApprovalMethod,
     PlanMode, modeLabel,
     questionsForItem, replyForItem, parseQuestionReply, serializeQuestionReply, collectAsyncQuestions,
     formatBytes,
@@ -73,12 +77,65 @@ function composer(storage = { getItem() { return null; }, setItem() {} }, sessio
   });
   const source = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
   get('plan-mode-menu').hidden = true;
+  get('quick-menu').hidden = true;
   vm.runInContext(readFileSync(new URL('../public/question-card.js', import.meta.url), 'utf8').replace(/^export /gm, ''), context);
+  vm.runInContext(readFileSync(new URL('../public/image-preview.js', import.meta.url), 'utf8').replace(/^export /gm, ''), context);
   vm.runInContext(source.replace(/^import .*;\n/gm, '').split("window.addEventListener('pagehide'")[0], context);
   const run = code => vm.runInContext(code, context);
   run("connected = true; threadId = 'thread-1';");
   return { get, run };
 }
+
+test('runtime model snapshots remain authoritative after older resume or empty read metadata', () => {
+  const { get, run } = composer();
+  run(`
+    observeModelSettings(threadId, { model: 'runtime-model', effort: 'high' });
+    rememberThreadStatus(threadId, { thread: { model: 'history-model', reasoningEffort: 'low' } });
+    observeModelSettings(threadId, { model: 'runtime-model', effort: 'high' });
+    modelOverrides.set(threadId, { model: 'next-model', effort: 'medium' });
+    updateControls();
+  `);
+  assert.match(get('current-model').textContent, /runtime-model · 高/);
+  assert.match(get('model-label').textContent, /尚未发送.*next-model/);
+  run(`rememberThreadStatus(threadId, { model: null, reasoningEffort: null }); updateControls();`);
+  assert.match(get('current-model').textContent, /runtime-model · 高/);
+  run(`observeModelSettings(threadId, { collaborationMode: { settings: { model: 'mode-model', reasoning_effort: 'medium' } } }); updateControls();`);
+  assert.match(get('current-model').textContent, /mode-model · 中/);
+});
+
+test('late quota reads cannot overwrite a newer notification or an account change', async () => {
+  const { run } = composer();
+  run(`quotaReadable = true; let resolveQuota; api = () => new Promise(resolve => { resolveQuota = resolve; });`);
+  const reading = run('readQuota()');
+  run(`accountQuota.update({ rateLimits: { primary: { usedPercent: 90 } } }); resolveQuota({ result: { rateLimits: { primary: { usedPercent: 0 } } }, receivedAt: Date.now() });`);
+  await reading;
+  assert.equal(run('accountQuota.buckets[0].windows[0].remaining'), 10);
+  const second = run('readQuota()');
+  run(`accountQuota.clear(); resolveQuota({ result: { rateLimits: { primary: { usedPercent: 0 } } }, receivedAt: Date.now() });`);
+  await second;
+  assert.equal(run('accountQuota.summary()'), '账号额度未完整同步');
+});
+
+test('a delayed state response cannot replay quota events covered by a newer account read', async () => {
+  const { run } = composer();
+  run(`tasksLoaded = true; threadId = ''; bridgeId = 'bridge-a'; quotaReadable = true; list = async () => {};
+    let stateReply, readReply;
+    api = path => new Promise(resolve => { if (path.startsWith('/api/state')) stateReply = resolve; else readReply = resolve; });`);
+  const polling = run('poll()'), reading = run('readQuota()');
+  run(`readReply({ result: { rateLimits: { primary: { usedPercent: 20 } } }, receivedAt: Date.now(), queriedAt: Date.now(), cursor: 5, bridgeId: 'bridge-a' });`);
+  await reading;
+  run(`stateReply({ ready: true, bridgeId: 'bridge-a', cursor: 5, reset: true, events: [{ cursor: 5, method: 'account/rateLimits/updated', params: { rateLimits: { primary: { usedPercent: 90 } } } }] });`);
+  await polling;
+  assert.equal(run('accountQuota.buckets[0].windows[0].remaining'), 80);
+  assert.ok(run('accountQuota.queriedAt'));
+  run(`quotaReadable = true; api = async () => ({ result: { rateLimits: { primary: { usedPercent: 0 } } }, receivedAt: Date.now(), queriedAt: Date.now(), cursor: 5, bridgeId: 'bridge-b' });`);
+  await run('readQuota()');
+  assert.equal(run('accountQuota.buckets[0].windows[0].remaining'), 80, 'read from another bridge cannot reuse the current cursor namespace');
+  run(`api = async () => ({ ready: false, bridgeId: 'bridge-b', cursor: 5, events: [] });`);
+  await run('poll()');
+  assert.equal(run('accountQuota.queriedAt'), null);
+  assert.equal(run('accountQuota.buckets.length'), 0);
+});
 
 test('stale steering records preserve echo identities and render an accepted answer once', () => {
   for (const field of ['serverUserMessageId', 'clientUserMessageId']) {
@@ -302,6 +359,7 @@ test('a reconnect rechecks cached active selection and never resumes a now archi
       : { projects: [], assignments: {} };
     command = async (method, params) => { calls.push({ method, params }); if (method !== 'thread/list') throw Error('must not resume archived task'); return { data: [], nextCursor: null }; };`);
   await run('poll()');
+  await run('Promise.all([...sessionLoader.pending.values()])');
   assert.equal(run("calls.every(call => call.method === 'thread/list')"), true);
   assert.equal(run("archiveStates.has('old-task')"), false);
   assert.equal(run('threadId'), '');
@@ -622,6 +680,7 @@ test('reload between creation and naming restores a fresh thread without resumin
     command = async () => { throw Error('must not resume or replay'); };
   `);
   await run('poll()');
+  await run('Promise.all([...sessionLoader.pending.values()])');
   assert.equal(run('threadId'), 'created');
   assert.equal(get('command-dialog').open, true);
   assert.equal(get('command-argument').value, '恢复名称');
@@ -1071,7 +1130,9 @@ test('an unavailable saved task keeps the healthy connection usable and still ch
     renderHistory = () => {}; renderApprovals = () => {};
   `);
   await run('poll()');
+  await run('Promise.all([...sessionLoader.pending.values()])');
   await run('poll()');
+  await run('Promise.all([...sessionLoader.pending.values()])');
   assert.equal(run('connected'), true);
   assert.equal(get('new').disabled, false);
   assert.equal(run('resumes'), 1, 'do not retry an unavailable task every second');
@@ -1091,9 +1152,209 @@ test('a failed history reload still consumes a reset cursor and refreshes approv
     renderHistory = () => {}; renderApprovals = () => { approvalRenders++; };
   `);
   await run('poll()');
+  await run('Promise.all([...sessionLoader.pending.values()])');
   await run('poll()');
+  await run('Promise.all([...sessionLoader.pending.values()])');
   assert.equal(run('cursor'), 5);
   assert.equal(run('resumes'), 2, 'one selection and history attempt, without repeating on the next poll');
   assert.equal(run('approvalRenders'), 2);
   assert.equal(run('connected'), true);
+});
+
+test('long histories do no item serialization or timeline merge on unchanged state polls', async t => {
+  const { run, get } = composer();
+  run(`tasksLoaded = true;
+    renderHistory({ id: threadId, turns: [{ id: 'long', status: 'completed', items: Array.from({ length: 2000 }, (_, i) => ({ id: 'i-' + i, type: 'agentMessage', text: 'message ' + i })) }] });
+    globalThis.merges = 0; globalThis.itemSerializations = 0;
+    const merge = timeline.thread.bind(timeline); timeline.thread = (...args) => { merges++; return merge(...args); };
+    const stringify = JSON.stringify; JSON.stringify = (...args) => { if (Array.isArray(args[0]) && args[0][0]?.type) itemSerializations++; return stringify(...args); };
+    api = async () => ({ ready: true, events: [], active: {}, approvals: [], cursor: 20 });`);
+  const first = get('history').children[0];
+  const start = performance.now();
+  for (let i = 0; i < 100; i++) await run('poll()');
+  t.diagnostic(`2000 messages / 100 idle VM polls: ${(performance.now() - start).toFixed(1)} ms`);
+  assert.equal(run('merges'), 0);
+  assert.equal(run('itemSerializations'), 0);
+  assert.equal(get('history').children[0], first);
+});
+
+test('slow history, receipt and mode reads do not hold cursor or subsequent approvals', async () => {
+  const { run } = composer();
+  run(`tasksLoaded = true; needsHistoryRefresh = true;
+    globalThis.resolveHistory = null; globalThis.states = 0; globalThis.approvalRenders = 0;
+    api = async () => ({ ready: true, capabilities: { threadMode: true }, cursor: ++states, events: [], active: {}, approvals: [] });
+    loadHistory = () => new Promise(resolve => { resolveHistory = resolve; });
+    recoverSubmission = () => new Promise(() => {});
+    syncThreadMode = () => new Promise(() => {});
+    renderApprovals = () => { approvalRenders++; };`);
+  await run('poll()');
+  assert.equal(run('cursor'), 1);
+  assert.equal(run('polling'), false);
+  await run('poll()');
+  assert.equal(run('cursor'), 2);
+  assert.equal(run('approvalRenders'), 2);
+  // Reopening the same ID still invalidates the original read's selection token.
+  run(`selection++; resolveHistory({ thread: { id: threadId, turns: [{ id: 'stale', items: [] }] } });`);
+  await run("sessionLoader.pending.get('history')");
+  assert.equal(run("timeline.histories.get(threadId)?.turns.some(turn => turn.id === 'stale') ?? false"), false);
+});
+
+test('events arriving during a history read win and coalesce a follow-up snapshot', async () => {
+  const { run } = composer();
+  run(`tasksLoaded = true; needsHistoryRefresh = true;
+    globalThis.reads = []; globalThis.states = 0;
+    loadHistory = () => new Promise(resolve => reads.push(resolve));
+    api = async () => ({ ready: true, cursor: ++states, active: {}, approvals: [], events: states === 2 ? [
+      { method: 'item/completed', params: { threadId, turnId: 'live', item: { id: 'new', type: 'agentMessage', text: 'newer event' } } }
+    ] : [] });`);
+  await run('poll()');
+  await run('poll()');
+  run(`reads[0]({ thread: { id: threadId, turns: [{ id: 'stale', items: [] }] } });`);
+  await run("sessionLoader.pending.get('history')");
+  assert.equal(run('reads.length'), 2);
+  assert.equal(run("timeline.thread(threadId).turns[0].items[0].text"), 'newer event');
+  run(`reads[1]({ thread: { id: threadId, turns: [{ id: 'live', items: [{ id: 'new', type: 'agentMessage', text: 'newer event' }] }] } });`);
+  await run("sessionLoader.pending.get('history')");
+  assert.equal(run("timeline.thread(threadId).turns[0].items[0].text"), 'newer event');
+});
+
+test('inactive DOM and timeline caches are bounded without touching drafts and current disclosures', () => {
+  const { run, get } = composer();
+  run(`renderHistory({ id: threadId, turns: [{ id: 'current', items: [{ id: 'c', type: 'commandExecution', command: 'keep' }] }] });
+    const currentView = historyViews.get(threadId);
+    for (let i = 0; i < 30; i++) {
+      const id = 'inactive-' + i;
+      drafts.set(id, 'draft ' + i);
+      timeline.snapshot(id, { id, turns: [] });
+      historyViews.set(id, { turns: new Map(), items: new Map() });
+      pruneHistory();
+    }`);
+  assert.equal(run('historyViews.size'), 7);
+  assert.equal(run('timeline.histories.size'), 7);
+  assert.equal(run('drafts.size'), 30);
+  assert.equal(run("historyViews.get(threadId) === currentView"), true);
+  assert.equal(get('history').children[0].dataset.turnId, 'current');
+});
+
+for (const transition of ['changed', 'reset', 'disconnected', 'network-error']) {
+  test(`${transition} invalidates old resume/history/list before any cache or selection commit`, async () => {
+    const { run, get } = composer();
+    get('message').value = 'keep current draft';
+    run(`tasksLoaded = true; bridgeId = 'bridge-a'; cursor = 1;
+      threads.set('sentinel', { id: 'sentinel' });
+      globalThis.responses = [];
+      command = (method, params) => new Promise(resolve => responses.push({ method, params, resolve }));
+      api = async path => path === '/api/projects' ? { projects: [], assignments: {} } : { status: 'unknown' };
+      delivery.begin('unknown-original', 'turn/start', threadId); uncertainSubmission = true;`);
+    const history = run('loadHistory(threadId).catch(() => null)');
+    const selection = run("select('other-thread')");
+    const listing = run('list()');
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(run('responses.length'), 3);
+    run(`list = async () => {};
+      api = async path => {
+        if (!path.startsWith('/api/state')) return { status: 'unknown' };
+        ${transition === 'network-error' ? "throw Error('offline');" : `return { ready: ${transition !== 'disconnected'}, bridgeId: '${transition === 'changed' ? 'bridge-b' : 'bridge-a'}', cursor: 5, reset: ${transition === 'reset'}, events: [], active: {}, approvals: [] };`}
+      };`);
+    await run('poll()');
+    run(`for (const reply of responses) reply.resolve(reply.method === 'thread/list'
+      ? { data: [{ id: 'old-bridge-task' }], nextCursor: 'old-cursor' }
+      : { thread: { id: reply.params.threadId, name: 'old bridge', status: { type: 'idle' } }, initialTurnsPage: { data: [{ id: 'old-turn', items: [] }] } });`);
+    await Promise.all([history, selection, listing]);
+    assert.equal(run('threadId'), 'thread-1');
+    assert.equal(get('message').value, 'keep current draft');
+    assert.equal(run("threads.has('old-bridge-task')"), false);
+    assert.equal(run("threads.has('sentinel')"), true);
+    assert.equal(run("taskStatus.has('other-thread')"), false);
+    assert.notEqual(run('nextCursor'), 'old-cursor');
+    assert.equal(run('historyPages.pages.size'), 0);
+    assert.equal(run('delivery.pending.key'), 'unknown-original');
+  });
+}
+
+test('late confirmed creation receipt settles its original key without selecting across a reconnect', async () => {
+  const { run, get } = composer();
+  get('message').value = 'preserve draft';
+  run(`delivery.begin('original-create', 'thread/start', undefined, 'Original name'); uncertainSubmission = true;
+    globalThis.receiptReply = null;
+    api = () => new Promise(resolve => { receiptReply = resolve; });`);
+  const receipt = run('recoverSubmission()');
+  run(`invalidateConnectionReads(); receiptReply({ status: 'completed', result: { thread: { id: 'old-created', turns: [] } } });`);
+  await receipt;
+  assert.equal(run('delivery.pending'), null);
+  assert.equal(run('delivery.createdNaming.threadId'), 'old-created');
+  assert.equal(run('threadId'), 'thread-1');
+  assert.equal(run("freshThreads.has('old-created')"), false);
+  run(`tasksLoaded = true; api = async () => ({ ready: true, cursor: 5, events: [], active: {}, approvals: [] });`);
+  await run('poll()');
+  assert.equal(run("freshThreads.has('old-created')"), false, 'later polls cannot automatically revive a confirmed old creation');
+  assert.equal(get('message').value, 'preserve draft');
+  assert.equal(get('command-dialog').open, false);
+});
+
+test('connection invalidation cancels queued automatic selection jobs and preserves newer scheduling', async () => {
+  const { run } = composer();
+  run(`globalThis.started = 0;
+    globalThis.oldJob = sessionLoader.run('created-naming', () => { started++; });
+    invalidateConnectionReads();
+    globalThis.freshJob = sessionLoader.run('created-naming', () => { started += 10; });`);
+  await run('Promise.all([oldJob, freshJob])');
+  assert.equal(run('started'), 10);
+});
+
+test('offline followed by same-bridge readiness cannot revive pre-offline reads', async () => {
+  const { run, get } = composer();
+  get('message').value = 'keep offline draft';
+  run(`tasksLoaded = true; bridgeId = 'same-bridge'; cursor = 10;
+    globalThis.replies = [];
+    command = (method, params) => new Promise(resolve => replies.push({ method, params, resolve }));
+    delivery.begin('offline-unknown', 'turn/start', threadId); uncertainSubmission = true;`);
+  const selecting = run("select('old-target')");
+  const history = run("historyPages.read(threadId).catch(() => null)");
+  await Promise.resolve(); await Promise.resolve();
+  run(`onOffline();
+    list = async () => {};
+    api = async path => path.startsWith('/api/state')
+      ? { ready: true, bridgeId: 'same-bridge', cursor: 11, events: [], approvals: [], active: {} }
+      : { status: 'unknown' };`);
+  await run('poll()');
+  assert.equal(run('connected'), true);
+  run(`for (const reply of replies) reply.resolve(reply.method === 'thread/items/list'
+    ? { data: [{ turnId: 'old', item: { id: 'old', type: 'agentMessage', text: 'stale' } }], nextCursor: 'old-cursor' }
+    : { thread: { id: reply.params.threadId, name: 'stale target' }, initialTurnsPage: { data: [] } });`);
+  await Promise.all([selecting, history]);
+  assert.equal(run('threadId'), 'thread-1');
+  assert.equal(run('historyPages.pages.size'), 0);
+  assert.equal(run("taskStatus.has('old-target')"), false);
+  assert.equal(run('delivery.pending.key'), 'offline-unknown');
+  assert.equal(get('message').value, 'keep offline draft');
+});
+
+test('reconnect captures reading position before approval layout changes and honors newer user intent', async () => {
+  const { run } = composer();
+  run(`connected = false; followingLatest = false; window.scrollY = 3837;
+    globalThis.restored = [];
+    window.scrollTo = options => { window.scrollY = options.top; restored.push(options.top); };
+    api = async () => ({ ready: true, bridgeId: 'same', cursor: 1, events: [], active: {}, approvals: [] });
+    list = async () => {};
+    renderApprovals = () => { window.scrollY = 4009; };`);
+  await run('poll()');
+  assert.equal(run('window.scrollY'), 3837);
+  await run('Promise.all([...sessionLoader.pending.values()])');
+  run(`globalThis.savedReading = captureReadingPosition(); beginReadingRestore(savedReading); window.scrollY = 2000; readingIntent++; finishReadingRestore(savedReading);`);
+  assert.equal(run('window.scrollY'), 2000, 'user movement after capture wins over late hydration');
+  assert.equal(run('document.documentElement.style.overflowAnchor'), '', 'native anchoring resumes after the reconnect transaction');
+});
+
+test('reading restoration stays suspended while an image preview owns scroll and focus', () => {
+  const { run } = composer();
+  run(`followingLatest = false; window.scrollY = 1200;
+    globalThis.savedReading = captureReadingPosition();
+    Object.defineProperty(images, 'active', { configurable: true, get: () => true });
+    window.scrollY = 0;
+    window.scrollTo = () => { throw Error('preview scroll must remain owned by the modal'); };
+    restoreReadingPosition(savedReading);`);
+  assert.equal(run('captureReadingPosition()'), null);
+  assert.equal(run('window.scrollY'), 0);
 });

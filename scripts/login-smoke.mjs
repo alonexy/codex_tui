@@ -11,6 +11,7 @@ try {
       const req = route.request(); requests.push({ url: req.url(), method: req.method(), data: req.postData() });
       const path = new URL(req.url()).pathname;
       if (path === '/api/login') { await route.fulfill({ status: 401, body: JSON.stringify({ error: '测试拒绝' }), contentType: 'application/json' }); return; }
+      if (path === '/api/passkeys/status') { await route.fulfill({ status: 404, body: JSON.stringify({ error: '未找到' }), contentType: 'application/json' }); return; }
       if (path === '/login.js' && mode === 'blocked-script') { await route.abort(); return; }
       const name = path === '/login' ? 'login.html' : path.slice(1);
       await route.fulfill({ body: await readFile(new URL('../public/' + name, import.meta.url)), contentType: name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html' });

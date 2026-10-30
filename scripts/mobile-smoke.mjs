@@ -82,9 +82,16 @@ try {
     assert.equal(await page.locator('#message').evaluate(el => el === document.activeElement), false);
     assert.equal(await page.locator('.composer-box').evaluate(el => el.offsetHeight), composerHeight, 'quick menu does not resize composer');
     const menu = await page.locator('#quick-menu').boundingBox();
-    assert.ok(menu.x >= 0 && menu.x + menu.width <= size.width && menu.y >= 0 && menu.y + menu.height <= size.height, 'quick menu stays on screen');
-    assert.ok(await page.locator('#quick-menu button').evaluateAll(buttons => buttons.every(b => b.getBoundingClientRect().height >= 44)));
     await page.screenshot({ path: new URL(`../output/playwright/mobile-quick-${size.width}.png`, import.meta.url).pathname });
+    assert.ok(menu.x >= 0 && menu.x + menu.width <= size.width && menu.y >= 0 && menu.y + menu.height <= size.height, `quick menu stays on screen: ${JSON.stringify({ viewport: size, menu })}`);
+    const headerBottom = await page.locator('.app-header').evaluate(el => el.getBoundingClientRect().bottom);
+    assert.ok(menu.y >= headerBottom + 8, `quick menu avoids header: ${JSON.stringify({ viewport: size, menu, headerBottom })}`);
+    assert.ok(await page.locator('#quick-title').evaluate(el => { const r = el.getBoundingClientRect(); return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)); }), 'quick menu title is unobscured');
+    assert.ok(await page.locator('#quick-menu button').evaluateAll(buttons => buttons.every(b => b.getBoundingClientRect().height >= 44)));
+    for (const button of await page.locator('#quick-menu button').all()) {
+      await button.scrollIntoViewIfNeeded();
+      assert.ok(await button.evaluate(el => { const r = el.getBoundingClientRect(); return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)); }), 'each quick action remains touch reachable');
+    }
     await page.keyboard.press('Escape');
     assert.equal(await page.locator('#quick-menu').isVisible(), false);
     await page.locator('#quick-toggle').tap();

@@ -116,7 +116,14 @@ try {
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `no collapsed overflow at ${width}`);
     await page.screenshot({ path: `${artifacts}/collapsed-${width}.png` });
   }
-  await summary('current').click();
+  try { await summary('current').click(); }
+  catch (error) {
+    console.error('Process disclosure geometry:', await page.evaluate(() => ({ viewport: innerHeight, scroll: scrollY,
+      dock: document.querySelector('#interaction-dock').getBoundingClientRect().toJSON(),
+      summary: document.querySelector('.turn[data-turn-id="current"] .turn-process > summary').getBoundingClientRect().toJSON() })));
+    await page.screenshot({ path: `${artifacts}/blocked-disclosure.png` });
+    throw error;
+  }
   await process('current').locator('.tool-record > summary').click();
   await process('current').locator('.tool-record pre').waitFor();
   assert.ok((await process('current').locator('pre').textContent()).length > 40000);
@@ -157,7 +164,7 @@ try {
   assert.equal(await turn('done').locator('.userMessage').count(), 2, 'overlapping page item appears once');
   assert.equal(await process('current').evaluate(node => node === window.savedProcess && node.open), true);
   await page.locator('#message').fill('保留草稿');
-  await page.locator('#approvals input').fill('保留回答');
+  await page.locator('#questions input').fill('保留回答');
   await switchTo('two');
   assert.equal(await process('current').evaluate(node => node.open), false, 'same turn ID cannot share disclosure state across threads');
   assert.equal(await page.getByText('未知新阶段也保持可见').isVisible(), true);
@@ -166,7 +173,7 @@ try {
   await switchTo('one');
   assert.equal(await process('current').evaluate(node => node === window.savedProcess && node.open), true);
   assert.equal(await page.locator('#message').inputValue(), '保留草稿');
-  assert.equal(await page.locator('#approvals input').inputValue(), '保留回答');
+  assert.equal(await page.locator('#questions input').inputValue(), '保留回答');
   await page.locator('#message').focus();
   networkDown = true;
   await page.waitForFunction(() => document.querySelector('#status').textContent.includes('连接中断'));

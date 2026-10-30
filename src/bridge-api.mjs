@@ -6,6 +6,7 @@ export function serveBridge(broker, socketPath, mode) {
   return listenLocal(socketPath, (method, path, data) => {
     if (method === 'GET' && path === '/status') return { service: 'codex-bridge', version: 1, pid: process.pid, bridgeId, mode, ready: broker.snapshot().ready };
     if (method === 'POST' && path === '/state') return { ...broker.snapshot(data.after), bridgeId, mode };
+    if (method === 'POST' && path === '/rate-limits') return broker.readRateLimits().then(value => ({ ...value, bridgeId }));
     if (method === 'POST' && path === '/command') return broker.getCommand(data.key);
     if (method === 'POST' && path === '/submit') return broker.submit(data.key, data.method, data.params);
     if (method === 'POST' && path === '/answer') { broker.answer(data.id, data.result); return { ok: true }; }
@@ -20,6 +21,7 @@ export function connectBridge(socketPath) {
       catch { return { ready: false, mode: 'disconnected', cursor: after, events: [], active: {}, approvals: [], reset: false }; }
     },
     getCommand: key => localRequest(socketPath, '/command', { key }),
+    readRateLimits: () => localRequest(socketPath, '/rate-limits', {}),
     submit: (key, method, params) => localRequest(socketPath, '/submit', { key, method, params }),
     answer: (id, result) => localRequest(socketPath, '/answer', { id, result }),
   };

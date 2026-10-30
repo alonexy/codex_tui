@@ -144,3 +144,18 @@ test('accepted steering cannot regress through pending events or stale snapshots
   assert.deepEqual(items[0].input, item.input);
   assert.equal(isProcessItem(items[0]), false);
 });
+test('selection snapshots preserve events received while history or mode reads were pending', () => {
+  const timeline = new Timeline();
+  timeline.snapshot('a', { id: 'a', turns: [{ id: 'turn', items: [{ id: 'item', type: 'agentMessage', text: 'old' }] }] });
+  const before = timeline.revision('a');
+  timeline.event({ method: 'item/agentMessage/delta', params: { threadId: 'a', turnId: 'turn', itemId: 'item', delta: ' newer' } });
+  const snapshot = { id: 'a', turns: [{ id: 'turn', items: [{ id: 'item', type: 'agentMessage', text: 'old' }] }] };
+  assert.equal(timeline.snapshot('a', snapshot, timeline.revision('a') !== before).turns[0].items[0].text, 'old newer');
+  assert.equal(timeline.thread('a').turns[0].items[0].text, 'old newer');
+  const revision = timeline.revision('a');
+  timeline.metadata('a', [{ id: 'turn', status: 'completed' }]);
+  const completed = timeline.revision('a');
+  assert.ok(completed > revision);
+  timeline.metadata('a', [{ id: 'turn', status: 'completed' }]);
+  assert.equal(timeline.revision('a'), completed, 'identical timing reads cannot create endless history retries');
+});

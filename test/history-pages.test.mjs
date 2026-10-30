@@ -3,6 +3,70 @@ import assert from 'node:assert/strict';
 import { HistoryPages } from '../public/history-pages.js';
 
 const entry = (id, text = id) => ({ turnId: 'turn', item: { id, type: 'userMessage', content: [{ type: 'text', text }] } });
+test('connection invalidation rejects old item pages before cache writes or metadata requests', async () => {
+  const replies = [], metadataCalls = [];
+  const history = new HistoryPages((method, params) => {
+    if (method === 'thread/items/list') return new Promise(resolve => replies.push(resolve));
+    metadataCalls.push(params.threadId); return Promise.resolve({ data: [], nextCursor: null });
+  });
+  const old = history.read('task');
+  const rejected = assert.rejects(old, /连接已失效/);
+  await Promise.resolve(); await Promise.resolve();
+  history.invalidate();
+  const fresh = history.read('task');
+  await Promise.resolve(); await Promise.resolve();
+  replies[0]({ data: [entry('old')], nextCursor: 'old-cursor' });
+  await rejected;
+  assert.equal(history.pages.size, 0);
+  assert.equal(metadataCalls.length, 0);
+  assert.equal(history.pending.get('task'), fresh);
+  replies[1]({ data: [entry('fresh')], nextCursor: null });
+  await fresh;
+  assert.equal(history.pages.get('task').entries[0].item.id, 'fresh');
+});
+
+test('old metadata cannot repopulate an invalidated cache or remove newer metadata work', async () => {
+  const replies = [], received = [];
+  const history = new HistoryPages(method => method === 'thread/items/list'
+    ? Promise.resolve({ data: [entry('item')], nextCursor: null })
+    : new Promise(resolve => replies.push(resolve)), (id, turns) => received.push(turns));
+  await history.read('task');
+  const old = history.metadataPending.get('task');
+  history.invalidate();
+  await history.read('task');
+  const fresh = history.metadataPending.get('task');
+  replies[0]({ data: [{ id: 'turn', status: 'failed' }], nextCursor: null });
+  await old;
+  assert.equal(received.length, 0);
+  assert.equal(history.metadataPending.get('task'), fresh);
+  assert.equal(history.pages.get('task').thread.turns[0].status, undefined);
+  replies[1]({ data: [{ id: 'turn', status: 'completed' }], nextCursor: null });
+  await fresh;
+  assert.equal(history.pages.get('task').thread.turns[0].status, 'completed');
+  assert.equal(received.length, 1);
+});
+
+test('cache eviction protects selected pages and pending metadata until reads finish', async () => {
+  let release;
+  const history = new HistoryPages(async (method, params) => {
+    if (method === 'thread/items/list') return { data: [entry(params.threadId)], nextCursor: null };
+    if (params.threadId === 'pending') return new Promise(resolve => { release = resolve; });
+    return { data: [], nextCursor: null };
+  }, () => {}, () => new Set(['selected']));
+  await history.read('selected');
+  await history.read('pending');
+  for (let i = 0; i < 20; i++) await history.read('other-' + i);
+  await Promise.all([...history.metadataPending.values()].filter(request => request !== history.metadataPending.get('pending')));
+  assert.ok(history.pages.has('selected'));
+  assert.ok(history.pages.has('pending'));
+  assert.equal(history.pages.size, 8);
+  release({ data: [{ id: 'turn', status: 'completed' }], nextCursor: null });
+  await history.metadataPending.get('pending');
+  assert.equal(history.pages.size, 7);
+  assert.ok(history.pages.has('selected'));
+  assert.ok(!history.metadata.has('pending'));
+});
+
 test('history pages preserve order, older messages and updated items without full-history calls', async () => {
   const responses = [
     { data: [entry('c'), entry('b')], nextCursor: 'older' },

@@ -1,5 +1,27 @@
 const approvalMethods = new Set(['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']);
-export const isAnswerable = request => approvalMethods.has(request.method) || request.method === 'item/tool/requestUserInput';
+export const mcpApprovalMethod = 'mcpServer/elicitation/request';
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+export function isMcpConfirmation(request) {
+  const params = request.params, schema = params?.requestedSchema;
+  // Only the verified empty confirmation form is safe to answer without a form renderer.
+  return request.method === mcpApprovalMethod && params?.mode === 'form' &&
+    typeof params.message === 'string' && typeof params.serverName === 'string' &&
+    typeof params.threadId === 'string' && !!params.threadId && object(schema) &&
+    schema.type === 'object' && object(schema.properties) && Object.keys(schema.properties).length === 0 &&
+    Object.keys(schema).every(key => ['type', 'properties', 'required'].includes(key)) &&
+    (!Object.hasOwn(schema, 'required') || schema.required === null || (Array.isArray(schema.required) && schema.required.length === 0));
+}
+export function isMcpUrlElicitation(request) {
+  const params = request.params;
+  if (request.method !== mcpApprovalMethod || params?.mode !== 'url' ||
+      !['threadId', 'serverName', 'message', 'elicitationId', 'url'].every(key => typeof params[key] === 'string' && params[key].trim()) ||
+      !/^https:\/\//i.test(params.url) || /[\s\\]/u.test(params.url)) return false;
+  try {
+    const url = new URL(params.url);
+    return url.protocol === 'https:' && !!url.hostname && !url.username && !url.password;
+  } catch { return false; }
+}
+export const isAnswerable = request => approvalMethods.has(request.method) || request.method === 'item/tool/requestUserInput' || isMcpConfirmation(request) || isMcpUrlElicitation(request);
 const kind = request => request.method === 'item/tool/requestUserInput' ? 'waitingOnUserInput' : 'waitingOnApproval';
 const waitingFlags = status => status?.type === 'active' && Array.isArray(status.activeFlags)
   ? status.activeFlags.filter(flag => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag)) : [];

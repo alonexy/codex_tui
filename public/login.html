@@ -13,7 +13,13 @@
 <body class="login-page">
   <main class="login-card">
     <h1>验证后继续</h1>
-    <p class="muted">输入访问密码，连接你的电脑。</p>
+    <p id="login-hint" class="muted">输入访问密码，连接你的电脑。</p>
+    <section id="passkey-login" aria-label="通行密钥登录">
+      <button id="passkey-login-button" class="secondary wide" type="button" disabled>使用通行密钥（Face ID）</button>
+      <p id="passkey-login-hint" class="small muted">通行密钥需 HTTPS 域名和支持的设备；也可使用下方访问密码。</p>
+      <p id="passkey-login-error" class="error" role="alert"></p>
+      <button id="passkey-login-cancel" class="secondary" type="button" hidden>取消，使用密码</button>
+    </section>
     <form id="login" method="post" action="/api/login">
       <label for="password">访问密码</label>
       <div class="password-row"><input id="password" type="password" autocomplete="current-password" required maxlength="1024" aria-describedby="login-error" enterkeyhint="go"><button id="show-password" class="secondary" type="button" aria-pressed="false">显示</button></div>

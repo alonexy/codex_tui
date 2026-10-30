@@ -76,6 +76,14 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; font: .9rem/1.6 ui-monospa
 .approval-card h2 { margin-top: 0; }
 .approval-card pre { margin-top: 6px; }
 .approval-card label select { margin: 8px 0; }
+.mcp-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.mcp-approval-actions button { margin: 0; min-height: 44px; max-width: 100%; white-space: normal; }
+.mcp-approval-field { margin: 10px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+#pending-dialog { width: min(580px, calc(100vw - 20px)); padding: 14px; overscroll-behavior: contain; }
+#pending-dialog .dialog-heading { position: sticky; top: -14px; padding-block: 8px; background: var(--surface); z-index: 1; }
+#pending-dialog .dialog-heading h2 { margin: 0; }
+#pending-dialog .dialog-heading button { flex: 0 0 auto; }
+#pending-dialog .approval-card { margin-block: 10px; }
 .message-body pre { background: var(--bg); padding: 12px; border-radius: 8px; white-space: pre; overflow-x: auto; }
 .tool-record pre { max-height: 300px; overflow: auto; }
 .task-card { display: block; width: 100%; text-align: left; margin: 10px 0; padding: 14px; }
@@ -100,6 +108,10 @@ dialog { width: min(440px, calc(100% - 32px)); max-height: 85dvh; overflow-y: au
 dialog::backdrop { background: #000b; }
 .login-page { display: grid; align-items: center; padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
 .login-card { width: min(100%, 440px); padding: 32px 20px; }
+#passkey-dialog { padding: 16px; }
+#passkey-dialog > h2 { margin: 0; }
+#passkey-dialog > p { margin: 8px 0; }
+#passkey-list article { margin: 8px 0; }
 .password-row { display: flex; gap: 8px; }
 .password-row button { flex: 0 0 auto; }
 .wide { width: 100%; margin: 20px 0 8px; }
@@ -174,7 +186,7 @@ main { max-width: 800px; padding-top: 4px; }
 #quick-toggle { border: 0; background: transparent; color: var(--muted); }
 #quick-toggle, #quick-menu button { -webkit-tap-highlight-color: transparent; }
 #quick-toggle[aria-expanded="true"] { color: var(--text); background: #404040; }
-#quick-menu { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 3; width: min(300px, 100%); max-height: min(360px, calc(100dvh - 100px)); overflow-y: auto; overscroll-behavior: contain; padding: 12px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: 0 8px 28px #0005; }
+#quick-menu { position: fixed; top: var(--quick-top, 8px); left: var(--quick-left, 8px); z-index: 3; width: min(300px, calc(100vw - 16px)); max-height: min(360px, calc(100dvh - 16px)); overflow-y: auto; overscroll-behavior: contain; padding: 12px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: 0 8px 28px #0005; }
 .quick-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 2px 4px 10px; font-size: .8rem; }
 .quick-heading span { color: var(--muted); font-size: .75rem; }
 .quick-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
@@ -191,8 +203,18 @@ main { max-width: 800px; padding-top: 4px; }
 .slash-option { display: flex; width: 100%; text-align: left; align-items: baseline; gap: 12px; background: transparent; color: var(--text); border: 0; }
 .slash-option span { color: var(--muted); font-size: .8rem; }
 #compose-hint { font-size: .75rem; }
-.image-attachment { display: block; width: fit-content; max-width: 100%; margin: 12px 0; }
+.image-attachment { display: block; width: fit-content; min-width: 44px; max-width: 100%; margin: 12px 0; padding: 0; border: 0; background: transparent; }
 .image-attachment img { display: block; width: auto; max-width: 100%; max-height: 420px; border-radius: 12px; object-fit: contain; }
+.image-preview-open { position: fixed; top: var(--image-preview-top); left: var(--image-preview-left); width: 100%; overflow: hidden; }
+#image-dialog { position: fixed; inset: 0; width: 100%; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); border: 0; border-radius: 0; overflow: hidden; background: var(--bg); }
+#image-dialog[open] { display: flex; flex-direction: column; gap: 8px; }
+.image-preview-toolbar { display: flex; justify-content: space-between; gap: 8px; flex: 0 0 auto; }
+.image-preview-toolbar button { min-width: 44px; min-height: 48px; }
+.image-preview-status { flex: 0 0 auto; font-size: .875rem; color: var(--muted); margin: 0; }
+.image-preview-stage { flex: 1; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; display: flex; align-items: center; justify-content: center; }
+.image-preview-stage img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; }
+.image-preview-stage.original-size { display: block; }
+.image-preview-stage.original-size img { max-width: none; max-height: none; margin: auto; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 #task-dialog { position: fixed; inset: 0 auto 0 0; margin: 0; height: 100dvh; max-height: 100dvh; width: min(88vw, 390px); border-radius: 0 20px 20px 0; padding: calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom)); overscroll-behavior: contain; }
 #task-dialog[open] { animation: sidebar-in 160ms ease-out; }
@@ -235,6 +257,12 @@ main { max-width: 800px; padding-top: 4px; }
 .approval-card { scroll-margin-top: calc(84px + env(safe-area-inset-top)); }
 .approval-card:focus { outline: 2px solid #f4d49a; outline-offset: 3px; }
 .composer-mode-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; margin: 0 4px 8px; }
+.composer-account-bar { display: flex; align-items: center; gap: 8px; min-width: 0; margin: 0 4px 6px; }
+.composer-account-bar button { min-width: 0; min-height: 36px; padding: 6px 8px; border: 0; background: transparent; color: var(--muted); font-size: .75rem; }
+#current-model { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+#account-quota { flex: 0 1 auto; max-width: 52%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#quota-details section { margin: 16px 0; overflow-wrap: anywhere; }
+#quota-details p { margin: 6px 0; }
 .plan-mode-control { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; border-radius: 24px; background: #292929; color: #c4c4c4; }
 #plan-mode { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; width: auto; min-width: 48px; max-width: 100%; height: 30px; min-height: 30px; padding: 3px 10px; font-size: .875rem; line-height: 24px; border: 0; border-radius: 24px; background: transparent; color: inherit; }
 #plan-mode-clear { display: grid; place-items: center; flex: 0 0 28px; width: 28px; height: 30px; min-height: 30px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; }
@@ -270,6 +298,9 @@ main { max-width: 800px; padding-top: 4px; }
 #workspace { display: flex; flex-direction: column; min-height: calc(100dvh - 76px - env(safe-area-inset-top)); }
 main:has(#interaction-dock) { padding-bottom: 0; }
 #interaction-dock { margin-top: auto; }
+/* Expanded questions can cover most of a phone screen; keep history reachable. */
+#interaction-dock:has(#questions:not([hidden])) { position: relative; }
+.composing #interaction-dock:has(#questions:not([hidden])) { position: sticky; }
 #interaction-dock #compose { position: static; flex: 0 0 auto; min-height: 0; }
 #questions { display: flex; flex-direction: column; min-height: 0; gap: 8px; overflow-y: auto; overscroll-behavior: contain; }
 #questions .approval-card { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; margin: 0; padding: 8px 12px; border-radius: 16px; }

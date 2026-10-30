@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { mergeRateLimits, quotaMetadata } from '../public/account-quota.js';
+import { mcpApprovalMethod, isMcpConfirmation, isMcpUrlElicitation } from '../public/approval-state.js';
 
 const allowed = new Set(['thread/list', 'thread/read', 'thread/start', 'thread/resume',
   'thread/turns/list', 'thread/items/list',
@@ -6,7 +8,10 @@ const allowed = new Set(['thread/list', 'thread/read', 'thread/start', 'thread/r
   'thread/name/set', 'thread/compact/start', 'thread/archive', 'thread/unarchive',
   'turn/start', 'turn/steer', 'turn/interrupt']);
 export const approvalMethods = new Set(['item/commandExecution/requestApproval',
-  'item/fileChange/requestApproval', 'item/tool/requestUserInput']);
+  'item/fileChange/requestApproval', 'item/tool/requestUserInput', mcpApprovalMethod]);
+const readMethods = new Set(['thread/list', 'thread/read', 'thread/resume', 'thread/turns/list',
+  'thread/items/list', 'thread/goal/get', 'account/rateLimits/read', 'initialize',
+  'config/read', 'model/list']);
 
 function settingsMetadata(settings) {
   const metadata = {};
@@ -29,13 +34,19 @@ function settingsMetadata(settings) {
 
 // Exactly one upstream connection. Desktop IDs never escape into Web request IDs.
 export class Broker extends EventEmitter {
-  constructor(send, desktop = () => {}, { ownedThreads = null, saveOwnedThread = () => {} } = {}) {
+  constructor(send, desktop = () => {}, { ownedThreads = null, saveOwnedThread = () => {},
+    rpcTimeoutMs = 30000, maxRoutes = 256, maxReadReceipts = 256, maxWriteReceipts = 5000 } = {}) {
     super();
     this.send = send;
     this.desktop = desktop;
     this.next = 0;
     this.routes = new Map();
     this.commands = new Map();
+    this.readCommands = new Map();
+    this.rpcTimeoutMs = rpcTimeoutMs;
+    this.maxRoutes = maxRoutes;
+    this.maxReadReceipts = maxReadReceipts;
+    this.maxWriteReceipts = maxWriteReceipts;
     this.approvals = new Map();
     this.active = new Map();
     this.starting = new Set();
@@ -48,6 +59,10 @@ export class Broker extends EventEmitter {
     this.cursor = 0;
     this.ready = false;
     this.closed = false;
+    this.quotaEpoch = 0;
+    this.quotaCache = null;
+    this.quotaRead = null;
+    this.quotaUpdates = null;
     this.ownedThreads = ownedThreads;
     this.saveOwnedThread = saveOwnedThread;
   }
@@ -60,8 +75,20 @@ export class Broker extends EventEmitter {
 
   fromDesktop(message) {
     if (message.method && Object.hasOwn(message, 'id')) {
+      if (this.routes.size >= this.maxRoutes) {
+        this.desktop({ id: message.id, error: { code: -32000, message: '未完成请求已达上限，请等待原请求结果' } });
+        return;
+      }
       const id = `bridge:${++this.next}`;
-      this.routes.set(id, { desktopId: message.id, method: message.method, threadId: message.params?.threadId, cursor: this.cursor });
+      const route = { desktopId: message.id, method: message.method, threadId: message.params?.threadId, cursor: this.cursor };
+      if (readMethods.has(message.method)) {
+        route.timer = setTimeout(() => {
+          this.routes.delete(id);
+          this.desktop({ id: message.id, error: { code: -32000, message: '读取超时，请稍后重试' } });
+        }, this.rpcTimeoutMs);
+        route.timer.unref?.();
+      }
+      this.routes.set(id, route);
       this.send({ ...message, id });
     } else if (Object.hasOwn(message, 'id')) {
       // A request may already have been answered on the phone.
@@ -77,6 +104,12 @@ export class Broker extends EventEmitter {
         this.approvals.set(message.id, message);
       }
       const p = message.params;
+      if (message.method === 'account/updated') { this.quotaEpoch++; this.quotaCache = null; this.quotaRead = null; this.quotaUpdates = null; }
+      if (message.method === 'account/rateLimits/updated') {
+        const update = quotaMetadata(p);
+        this.quotaUpdates?.push(update);
+        this.quotaCache = { ...this.quotaCache, result: mergeRateLimits(this.quotaCache?.result, update), receivedAt: Date.now(), cursor: this.cursor + 1 };
+      }
       if (message.method === 'thread/status/changed') {
         this.threadStatus.set(p.threadId, p.status); this.statusCursors.set(p.threadId, this.cursor + 1);
       }
@@ -98,6 +131,7 @@ export class Broker extends EventEmitter {
     const route = this.routes.get(message.id);
     if (!route) return;
     this.routes.delete(message.id);
+    clearTimeout(route.timer);
     if (route.method === 'thread/archive') this.archiving.delete(route.threadId);
     if (!message.error) {
       const threads = [...(Array.isArray(message.result?.data) ? message.result.data : []), message.result?.thread];
@@ -131,13 +165,51 @@ export class Broker extends EventEmitter {
     else route.resolve(message.result);
   }
 
-  rpc(method, params, command) {
+  rpc(method, params, command, timeoutMs = this.rpcTimeoutMs) {
     if (this.closed) return Promise.reject(new Error('App Server 已断开'));
+    if (this.routes.size >= this.maxRoutes) return Promise.reject(new Error('未完成请求已达上限，请等待原请求结果'));
     const id = `bridge:${++this.next}`;
     return new Promise((resolve, reject) => {
-      this.routes.set(id, { resolve, reject, command, method, threadId: params?.threadId, cursor: this.cursor });
-      this.send({ id, method, params });
+      const read = readMethods.has(method);
+      const route = { resolve, reject, command, method, threadId: params?.threadId, cursor: this.cursor };
+      route.timer = setTimeout(() => {
+        if (read) this.routes.delete(id);
+        const error = Object.assign(new Error(read ? '读取超时，请稍后重试' : '请求超时，执行结果未知；请查询原提交回执，不要重复提交'), { unknown: !read });
+        if (command) {
+          command.status = read ? 'failed' : 'unknown';
+          command.error = { message: error.message };
+        }
+        reject(error);
+      }, timeoutMs);
+      route.timer.unref?.();
+      this.routes.set(id, route);
+      try { this.send({ id, method, params }); }
+      catch (error) {
+        clearTimeout(route.timer);
+        if (read) this.routes.delete(id);
+        reject(Object.assign(error, { unknown: !read }));
+      }
     });
+  }
+
+  readRateLimits() {
+    if (!this.ready || this.closed) return Promise.reject(new Error('App Server 尚未连接'));
+    if (this.quotaCache?.queriedAt && Date.now() - this.quotaCache.queriedAt < 60000) return Promise.resolve(this.quotaCache);
+    if (this.quotaCache?.errorAt && Date.now() - this.quotaCache.errorAt < 60000) return Promise.reject(new Error(this.quotaCache.error));
+    if (this.quotaRead) return this.quotaRead;
+    const epoch = this.quotaEpoch;
+    const updates = [];
+    this.quotaUpdates = updates;
+    const request = this.rpc('account/rateLimits/read', { excludeResetCreditDetails: true }, undefined, 4000).then(result => {
+      if (epoch !== this.quotaEpoch) throw new Error('账号额度已变化，请重新读取');
+      return (this.quotaCache = { result: updates.reduce(mergeRateLimits, quotaMetadata(result)), receivedAt: Date.now(), queriedAt: Date.now(), cursor: this.cursor });
+    }, () => {
+      const error = '账号未提供额度或暂时无法读取，请稍后重试（API key 登录可能不支持）';
+      if (epoch === this.quotaEpoch) this.quotaCache = { ...this.quotaCache, error, errorAt: Date.now() };
+      throw new Error(error);
+    }).finally(() => { if (this.quotaRead === request) { this.quotaRead = null; this.quotaUpdates = null; } });
+    this.quotaRead = request;
+    return request;
   }
 
   async initialize() {
@@ -147,9 +219,14 @@ export class Broker extends EventEmitter {
   }
 
   submit(key, method, params = {}) {
+    try { return this.#submit(key, method, params); }
+    catch (error) { throw Object.assign(error, { submission: 'rejected' }); }
+  }
+
+  #submit(key, method, params) {
     if (typeof key !== 'string' || !/^[a-zA-Z0-9-]{8,100}$/.test(key)) throw new Error('缺少有效提交 ID');
     const fingerprint = JSON.stringify({ method, params });
-    const old = this.commands.get(key);
+    const old = this.commands.get(key) ?? this.readCommands.get(key);
     if (old) {
       if (old.fingerprint !== fingerprint) throw new Error('提交 ID 已被不同内容使用');
       return old;
@@ -160,7 +237,14 @@ export class Broker extends EventEmitter {
     if (this.ownedThreads && !['thread/list', 'thread/start'].includes(method) && !this.ownedThreads.has(params.threadId)) {
       throw new Error('独立模式只能操作本服务创建的任务，不能恢复桌面任务');
     }
-    if (this.commands.size >= 5000) throw new Error('本次服务提交记录已满，请重启后继续');
+    const read = readMethods.has(method);
+    if (!read && this.commands.size >= this.maxWriteReceipts) throw new Error('本次服务执行回执已满，已有提交 ID 仍可查询；请确认原请求结果后维护服务');
+    if (this.routes.size >= this.maxRoutes) throw new Error('未完成请求已达上限，请等待原请求结果');
+    if (read && this.readCommands.size >= this.maxReadReceipts) {
+      const expired = [...this.readCommands].find(([, command]) => command.status !== 'pending');
+      if (!expired) throw new Error('未完成读取已达上限，请等待原请求结果');
+      this.readCommands.delete(expired[0]);
+    }
     if (['thread/archive', 'thread/unarchive'].includes(method) && (typeof params.threadId !== 'string' || !params.threadId)) throw new Error('缺少任务 ID');
     if (method === 'thread/archive' && (this.active.has(params.threadId) || this.starting.has(params.threadId) ||
         this.threadStatus.get(params.threadId)?.type === 'active' ||
@@ -178,12 +262,14 @@ export class Broker extends EventEmitter {
       throw new Error('执行轮次已变化，请刷新后重试');
     }
     const command = { key, fingerprint, method, status: 'pending' };
-    this.commands.set(key, command);
+    (read ? this.readCommands : this.commands).set(key, command);
     if (method === 'turn/start') this.starting.add(params.threadId);
     if (method === 'thread/archive') this.archiving.add(params.threadId);
     // Never retry an execution request on timeout. The client polls this receipt.
     this.rpc(method, params, command).catch(error => {
-      command.status = this.closed ? 'unknown' : 'failed';
+      // A late reply may have completed the receipt before this rejection runs.
+      if (command.status === 'completed' || command.status === 'failed') return;
+      command.status = !read && (this.closed || error.unknown) ? 'unknown' : 'failed';
       command.error = error.rpc ?? { message: error.message };
     });
     return command;
@@ -192,7 +278,20 @@ export class Broker extends EventEmitter {
   answer(id, result) {
     const request = this.approvals.get(id);
     if (!request || !approvalMethods.has(request.method)) throw new Error('请求已处理或须在桌面处理');
-    if (request.method !== 'item/tool/requestUserInput') {
+    if (!this.ready || this.closed) throw new Error('App Server 尚未连接');
+    if (request.method === mcpApprovalMethod) {
+      const urlMode = isMcpUrlElicitation(request);
+      if (!isMcpConfirmation(request) && !urlMode) throw new Error('此 MCP 请求须在桌面处理');
+      if (!result || typeof result !== 'object' || Array.isArray(result) ||
+          Object.keys(result).some(key => !['action', 'content'].includes(key)) ||
+          !['accept', 'decline', 'cancel'].includes(result.action)) throw new Error('无效 MCP 审批结果');
+      if (urlMode) {
+        if (Object.hasOwn(result, 'content')) throw new Error('无效 MCP URL 回复内容');
+      } else if (result.action === 'accept') {
+        if (!result.content || typeof result.content !== 'object' || Array.isArray(result.content) ||
+            Object.keys(result.content).length) throw new Error('无效 MCP 空表单内容');
+      } else if (Object.hasOwn(result, 'content') && result.content !== null) throw new Error('无效 MCP 拒绝或取消内容');
+    } else if (request.method !== 'item/tool/requestUserInput') {
       if (!['accept', 'decline', 'cancel'].includes(result?.decision)) throw new Error('无效审批结果');
     } else {
       const answers = result?.answers;
@@ -219,7 +318,7 @@ export class Broker extends EventEmitter {
   snapshot(after = 0) {
     return {
       ready: this.ready && !this.closed, cursor: this.cursor,
-      capabilities: { paginatedHistory: true, taskCommands: true, taskArchive: true, threadSettings: true },
+      capabilities: { paginatedHistory: true, taskCommands: true, taskArchive: true, threadSettings: true, accountRateLimits: true, mcpUrlElicitation: true },
       reset: after > this.cursor || (this.events.length > 0 && after < this.events[0].cursor - 1),
       events: this.events.filter(e => e.cursor > after),
       active: Object.fromEntries(this.active),
@@ -229,13 +328,17 @@ export class Broker extends EventEmitter {
   }
 
   getCommand(key) {
-    return this.commands.get(key) ?? null;
+    return this.commands.get(key) ?? this.readCommands.get(key) ?? null;
   }
 
   close() {
     this.closed = true;
     this.ready = false;
-    for (const route of this.routes.values()) route.reject?.(new Error('连接中断，执行结果未知；不要重复提交'));
+    this.quotaEpoch++; this.quotaCache = null; this.quotaUpdates = null;
+    for (const route of this.routes.values()) {
+      clearTimeout(route.timer);
+      route.reject?.(new Error(readMethods.has(route.method) ? '连接中断，读取失败；请稍后重试' : '连接中断，执行结果未知；不要重复提交'));
+    }
     this.routes.clear();
     this.approvals.clear();
     this.record('bridge/disconnected', {});

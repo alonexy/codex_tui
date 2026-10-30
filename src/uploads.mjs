@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
-export async function saveUpload(directory, value) {
+export function decodeUpload(value) {
   const match = typeof value === 'string' && /^data:image\/(png|jpeg|webp);base64,([A-Za-z0-9+/]+={0,2})$/.exec(value);
   if (!match) throw Error('请选择 PNG、JPEG 或 WebP 图片');
   const data = Buffer.from(match[2], 'base64');
@@ -11,8 +11,13 @@ export async function saveUpload(directory, value) {
     : match[1] === 'jpeg' ? data[0] === 255 && data[1] === 216 && data[2] === 255
     : data.subarray(0, 4).toString() === 'RIFF' && data.subarray(8, 12).toString() === 'WEBP';
   if (!valid) throw Error('图片内容与格式不匹配');
+  return { data, extension: match[1] };
+}
+
+export async function saveUpload(directory, value) {
+  const { data, extension } = decodeUpload(value);
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, `${randomUUID()}.${match[1]}`);
+  const path = join(directory, `${randomUUID()}.${extension}`);
   await writeFile(path, data, { mode: 0o600, flag: 'wx' });
   return { type: 'localImage', path };
 }

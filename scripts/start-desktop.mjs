@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { serviceConfig } from '../src/service-config.mjs';
 import { localRequest } from '../src/local-ipc.mjs';
 import { manageWeb, webStatus } from './web-service.mjs';
+import { resolveCodexCli } from '../src/codex-cli.mjs';
 
 const exec = promisify(execFile);
 const pause = () => new Promise(resolve => setTimeout(resolve, 1000));
@@ -81,6 +82,7 @@ async function main() {
   }
   const running = await appPids();
   if (checkOnly) throw new Error(`新版常驻桥接未就绪；桌面主进程：${running.join(', ') || '未运行'}。${running.length ? '首次迁移需要一次退出加载新版；日常 Web 重启无需退出。' : ''}`);
+  resolveCodexCli();
   if (running.length) {
     console.log('现有桌面尚未加载新版常驻桥接。首次迁移请保存任务并 Cmd+Q 退出一次。\n此命令会等待，退出后自动继续；以后 Web 更新使用 npm run web:restart，不再退出桌面。');
     await waitForExit({ pids: appPids });
